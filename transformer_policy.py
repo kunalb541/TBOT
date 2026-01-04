@@ -12,11 +12,12 @@ Key Features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Type
 import numpy as np
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.type_aliases import Schedule
 import gymnasium as gym
 
 from model import (
@@ -224,12 +225,13 @@ class TransformerActorCriticPolicy(ActorCriticPolicy):
         self,
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
-        lr_schedule,
+        lr_schedule: Schedule,
         d_model: int = 128,
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
+        *args,
         **kwargs
     ):
         """
@@ -242,7 +244,7 @@ class TransformerActorCriticPolicy(ActorCriticPolicy):
             num_layers: Number of transformer layers
             dim_feedforward: FFN dimension
             dropout: Dropout rate
-            **kwargs: Additional arguments for ActorCriticPolicy
+            *args, **kwargs: Additional arguments for ActorCriticPolicy
         """
         # Store transformer config
         self.d_model = d_model
@@ -251,47 +253,61 @@ class TransformerActorCriticPolicy(ActorCriticPolicy):
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
         
+        # CRITICAL: Set features_extractor_class and kwargs BEFORE calling super().__init__
+        # This ensures both policy and value networks use the same extractor
+        kwargs['features_extractor_class'] = TransformerFeatureExtractor
+        kwargs['features_extractor_kwargs'] = dict(
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            features_dim=128
+        )
+        
+        # Remove net_arch if present (we don't use it)
+        kwargs.pop('net_arch', None)
+        
         super().__init__(
             observation_space,
             action_space,
             lr_schedule,
+            *args,
             **kwargs
         )
     
     def _build_mlp_extractor(self) -> None:
         """
-        Build the feature extractor.
+        Build the MLP extractor.
         
-        We override this to use our Transformer-based extractor
-        instead of the default MLP.
+        We override this to use a simple identity mapping since our
+        feature extractor already does all the work.
         """
-        self.features_extractor = TransformerFeatureExtractor(
-            observation_space=self.observation_space,
-            d_model=self.d_model,
-            nhead=self.nhead,
-            num_layers=self.num_layers,
-            dim_feedforward=self.dim_feedforward,
-            dropout=self.dropout,
-            features_dim=128
-        )
+        # The features_extractor is already set by the parent class
+        # We just need to create a simple pass-through MLP extractor
         
-        # Create dummy mlp_extractor to satisfy stable-baselines3
-        # The features_extractor already does all the work
-        latent_dim = self.d_model
+        latent_dim = self.features_dim
         
-        class DummyMLPExtractor(nn.Module):
-            """Dummy MLP extractor - features already extracted by transformer."""
-            def __init__(self, latent_dim_pi, latent_dim_vf):
+        class IdentityMLPExtractor(nn.Module):
+            """Identity MLP extractor - features already extracted by transformer."""
+            def __init__(self, latent_dim_pi: int, latent_dim_vf: int):
                 super().__init__()
                 self.latent_dim_pi = latent_dim_pi
                 self.latent_dim_vf = latent_dim_vf
+                # Simple pass-through
                 self.policy_net = nn.Identity()
                 self.value_net = nn.Identity()
             
-            def forward(self, features):
+            def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 return features, features
+            
+            def forward_actor(self, features: torch.Tensor) -> torch.Tensor:
+                return self.policy_net(features)
+            
+            def forward_critic(self, features: torch.Tensor) -> torch.Tensor:
+                return self.value_net(features)
         
-        self.mlp_extractor = DummyMLPExtractor(latent_dim, latent_dim)
+        self.mlp_extractor = IdentityMLPExtractor(latent_dim, latent_dim)
 
 
 def create_transformer_policy(
