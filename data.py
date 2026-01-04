@@ -14,6 +14,8 @@ FIXES:
 - Proper lookback context for val/test sets
 - Returns scaler statistics for inference
 - Handles Binance API rate limits
+- Better retry logic and error handling
+- Fixed connection timeout issues
 """
 
 import numpy as np
@@ -23,6 +25,8 @@ from datetime import datetime, timedelta
 import time
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -84,6 +88,27 @@ class BinanceDataFetcher:
         self._last_request_time = 0
         self._min_request_interval = 0.1  # 100ms between requests
         
+        # Setup session with retry logic
+        self._session = self._create_session()
+    
+    def _create_session(self) -> requests.Session:
+        """Create a session with retry logic."""
+        session = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        
+        return session
+        
     def _rate_limit(self):
         """Simple rate limiting."""
         elapsed = time.time() - self._last_request_time
@@ -95,11 +120,11 @@ class BinanceDataFetcher:
         """Make API request with retry logic."""
         url = f"{self.base_url}{endpoint}"
         
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 self._rate_limit()
-                response = requests.get(url, params=params, timeout=30)
+                response = self._session.get(url, params=params, timeout=30)
                 
                 if response.status_code == 200:
                     return response.json()
@@ -107,13 +132,26 @@ class BinanceDataFetcher:
                     wait_time = int(response.headers.get('Retry-After', 60))
                     logger.warning(f"Rate limited. Waiting {wait_time}s...")
                     time.sleep(wait_time)
+                elif response.status_code == 418:  # IP ban
+                    logger.error("IP banned by Binance. Wait and try again later.")
+                    time.sleep(60 * (attempt + 1))
                 else:
                     logger.error(f"API error: {response.status_code} - {response.text}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
                     
+            except requests.exceptions.Timeout:
+                logger.error(f"Request timeout (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"Connection error (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5 * (attempt + 1))
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
         
         return None
     
@@ -217,7 +255,7 @@ class BinanceDataFetcher:
             )
             
             if df_batch is None or len(df_batch) == 0:
-                logger.warning(f"No more data available. Got {len(all_data)} candles.")
+                logger.warning(f"No more data available. Got {sum(len(d) for d in all_data)} candles.")
                 break
             
             all_data.append(df_batch)
@@ -228,6 +266,9 @@ class BinanceDataFetcher:
             current_end_time = int(oldest_time.timestamp() * 1000) - 1
             
             logger.info(f"  Fetched {len(df_batch)} candles, {remaining} remaining...")
+            
+            # Small delay to be nice to the API
+            time.sleep(0.1)
         
         if not all_data:
             logger.error("No data fetched. Using fake data as fallback.")
