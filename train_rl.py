@@ -57,6 +57,8 @@ class TradingMetricsCallback(BaseCallback):
     - Number of trades per episode
     - Win rate
     - Sharpe ratio
+    
+    Compatible with both DummyVecEnv and SubprocVecEnv.
     """
     
     def __init__(self, verbose: int = 0, log_freq: int = 1):
@@ -67,45 +69,59 @@ class TradingMetricsCallback(BaseCallback):
         self.episode_steps = []
     
     def _on_step(self) -> bool:
-        # Check if episode is done
-        dones = self.locals.get('dones')
-        if dones is None:
+        # Get infos from the rollout
+        # For SubprocVecEnv, we need to get metrics from the info dict
+        # which is populated when episodes end
+        
+        # Check if we have episode info in the locals
+        infos = self.locals.get('infos', [])
+        
+        if not infos:
             return True
         
-        # Log metrics for completed episodes
-        for idx, done in enumerate(dones):
-            if done:
-                # Get environment
-                env = self.training_env.envs[idx]
+        # Process each info dict (one per parallel environment)
+        for info in infos:
+            # Check if episode is done (SB3 adds episode info to info dict)
+            if 'episode' in info:
+                # Standard SB3 episode stats
+                episode_reward = info['episode']['r']
+                episode_length = info['episode']['l']
                 
-                # Extract metrics
-                if hasattr(env, 'balance'):
-                    episode_return = (env.balance - env.initial_balance) / env.initial_balance
-                    n_trades = len(env.trades)
-                    
-                    self.episode_returns.append(episode_return)
-                    self.episode_trades.append(n_trades)
-                    
-                    # Log to tensorboard
-                    self.logger.record('trading/episode_return_pct', episode_return * 100)
-                    self.logger.record('trading/num_trades', n_trades)
-                    self.logger.record('trading/final_balance', env.balance)
-                    
-                    if n_trades > 0:
-                        pnls = [t['pnl'] for t in env.trades]
-                        winning = sum(1 for pnl in pnls if pnl > 0)
-                        win_rate = winning / n_trades
-                        avg_pnl = np.mean(pnls)
-                        
-                        self.logger.record('trading/win_rate', win_rate)
-                        self.logger.record('trading/avg_trade_pnl', avg_pnl)
-                    
-                    # Calculate Sharpe ratio over recent episodes
-                    if len(self.episode_returns) >= 30:
-                        recent_returns = self.episode_returns[-30:]
-                        if np.std(recent_returns) > 0:
-                            sharpe = np.mean(recent_returns) / np.std(recent_returns) * np.sqrt(252)
-                            self.logger.record('trading/sharpe_ratio', sharpe)
+                # Log to tensorboard
+                self.logger.record('rollout/ep_rew_mean', episode_reward)
+                self.logger.record('rollout/ep_len_mean', episode_length)
+            
+            # Check for custom trading metrics
+            # These should be added by the environment when episode ends
+            if 'balance' in info:
+                balance = info['balance']
+                initial_balance = info.get('initial_balance', 10000.0)
+                episode_return = (balance - initial_balance) / initial_balance
+                
+                self.episode_returns.append(episode_return)
+                
+                # Log trading metrics
+                self.logger.record('trading/episode_return_pct', episode_return * 100)
+                self.logger.record('trading/final_balance', balance)
+            
+            # Log trade statistics if available
+            if 'num_trades' in info:
+                n_trades = info['num_trades']
+                self.episode_trades.append(n_trades)
+                self.logger.record('trading/num_trades', n_trades)
+            
+            if 'win_rate' in info and info.get('num_trades', 0) > 0:
+                self.logger.record('trading/win_rate', info['win_rate'])
+            
+            if 'avg_trade_pnl' in info and info.get('num_trades', 0) > 0:
+                self.logger.record('trading/avg_trade_pnl', info['avg_trade_pnl'])
+            
+            # Calculate Sharpe ratio over recent episodes
+            if len(self.episode_returns) >= 30:
+                recent_returns = self.episode_returns[-30:]
+                if np.std(recent_returns) > 0:
+                    sharpe = np.mean(recent_returns) / np.std(recent_returns) * np.sqrt(252)
+                    self.logger.record('trading/sharpe_ratio', sharpe)
         
         return True
 
@@ -187,7 +203,7 @@ def prepare_data(
     Prepare training and evaluation data.
     
     Returns:
-        train_df, val_df, test_df, feature_cols
+        train_df, val_df, test_df, feature_cols, scaler_stats
     """
     logger.info(f"\n=== Preparing Data ===")
     logger.info(f"Symbol: {symbol}")
