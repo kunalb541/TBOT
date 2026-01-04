@@ -134,11 +134,15 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         position = observations['position']
         position_value = observations['position_value']
         
-        # Ensure position_value is 2D (batch, 1)
+        # FIXED: Robust handling of position_value dimensions
+        # Always ensure it's (batch, 1)
+        while position_value.dim() > 2:
+            position_value = position_value.squeeze(-1)
+        
         if position_value.dim() == 1:
             position_value = position_value.unsqueeze(-1)
-        elif position_value.dim() == 3:
-            position_value = position_value.squeeze(1)
+        
+        # At this point, position_value should be (batch, 1)
         
         # Project market data
         x = self.input_proj(market_data)
@@ -157,6 +161,9 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         x = x[:, -1, :]  # (batch, d_model)
         
         # Embed position state
+        # Handle position being 2D from vectorized envs
+        if position.dim() > 1:
+            position = position.squeeze(-1)
         pos_embed = self.position_embed(position.long())  # (batch, 32)
         
         # Combine all features (all should be (batch, feature_dim) now)
@@ -370,7 +377,16 @@ class PretrainedTransformerPolicy(nn.Module):
         transformer_out = self.transformer(market_data, return_all_positions=False)
         
         # Add position info
+        if position.dim() > 1:
+            position = position.squeeze(-1)
         pos_embed = self.position_embed(position.long())
+        
+        # Ensure position_value is 2D
+        while position_value.dim() > 2:
+            position_value = position_value.squeeze(-1)
+        if position_value.dim() == 1:
+            position_value = position_value.unsqueeze(-1)
+        
         combined = torch.cat([transformer_out, pos_embed, position_value], dim=-1)
         
         # Policy and value outputs
