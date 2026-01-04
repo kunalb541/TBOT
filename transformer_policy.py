@@ -134,6 +134,12 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         position = observations['position']
         position_value = observations['position_value']
         
+        # Ensure position_value is 2D (batch, 1)
+        if position_value.dim() == 1:
+            position_value = position_value.unsqueeze(-1)
+        elif position_value.dim() == 3:
+            position_value = position_value.squeeze(1)
+        
         # Project market data
         x = self.input_proj(market_data)
         
@@ -153,7 +159,7 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         # Embed position state
         pos_embed = self.position_embed(position.long())  # (batch, 32)
         
-        # Combine all features
+        # Combine all features (all should be (batch, feature_dim) now)
         combined = torch.cat([x, pos_embed, position_value], dim=-1)
         features = self.feature_combine(combined)
         
@@ -224,6 +230,24 @@ class TransformerActorCriticPolicy(ActorCriticPolicy):
             dropout=self.dropout,
             features_dim=128
         )
+        
+        # Create dummy mlp_extractor to satisfy stable-baselines3
+        # The features_extractor already does all the work
+        latent_dim = self.d_model
+        
+        class DummyMLPExtractor(nn.Module):
+            """Dummy MLP extractor - features already extracted by transformer."""
+            def __init__(self, latent_dim_pi, latent_dim_vf):
+                super().__init__()
+                self.latent_dim_pi = latent_dim_pi
+                self.latent_dim_vf = latent_dim_vf
+                self.policy_net = nn.Identity()
+                self.value_net = nn.Identity()
+            
+            def forward(self, features):
+                return features, features
+        
+        self.mlp_extractor = DummyMLPExtractor(latent_dim, latent_dim)
 
 
 def create_transformer_policy(
