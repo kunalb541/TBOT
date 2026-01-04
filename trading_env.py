@@ -91,7 +91,8 @@ class TradingEnv(gym.Env):
         
         # Extract feature matrix
         self.features = df[feature_cols].values
-        self.prices = df['close'].values
+        self.prices = df['close'].values  # For stop loss/take profit checks
+        self.opens = df['open'].values  # For realistic trade execution
         self.highs = df['high'].values
         self.lows = df['low'].values
         
@@ -301,6 +302,11 @@ class TradingEnv(gym.Env):
         """
         Execute one step in the environment.
         
+        ANTI-LOOKAHEAD MEASURE:
+        - Model sees data up to current_step (t)
+        - Decision made based on that data
+        - Execution happens at current_step+1 open price (t+1)
+        
         Args:
             action: 0=HOLD, 1=LONG, 2=SHORT
             
@@ -312,22 +318,34 @@ class TradingEnv(gym.Env):
             info: Additional information
         """
         action = Action(action)
-        current_price = self.prices[self.current_step]
+        current_price = self.prices[self.current_step]  # For stop loss checks only
         reward = 0.0
         info = {'step': self.current_step}
         
-        # Check stop loss / take profit FIRST
+        # Check if we can execute (need next candle for execution)
+        if self.current_step + 1 >= len(self.opens):
+            # End of data
+            terminated = True
+            truncated = False
+            observation = self._get_observation()
+            info['termination_reason'] = 'end_of_data'
+            return observation, reward, terminated, truncated, info
+        
+        # CRITICAL: Execute at NEXT candle's open (no lookahead!)
+        execution_price = self.opens[self.current_step + 1]
+        
+        # Check stop loss / take profit FIRST (use intrabar highs/lows)
         sl_tp_hit, exit_price, reason = self._check_stop_loss_take_profit()
         if sl_tp_hit:
             reward, close_info = self._close_position(exit_price)
             info.update(close_info)
             info['sl_tp_reason'] = reason
         
-        # Execute action
+        # Execute action at NEXT candle's open
         if action == Action.HOLD:
             if self.position != Position.FLAT:
-                # Close position
-                close_reward, close_info = self._close_position(current_price)
+                # Close position at next candle's open
+                close_reward, close_info = self._close_position(execution_price)
                 reward += close_reward
                 info.update(close_info)
             else:
@@ -337,13 +355,13 @@ class TradingEnv(gym.Env):
         
         elif action == Action.LONG:
             if self.position == Position.SHORT:
-                # Close short first
-                close_reward, _ = self._close_position(current_price)
+                # Close short first at next candle's open
+                close_reward, _ = self._close_position(execution_price)
                 reward += close_reward
             
             if self.position == Position.FLAT:
-                # Open long
-                open_reward, open_info = self._open_position(Position.LONG, current_price)
+                # Open long at next candle's open
+                open_reward, open_info = self._open_position(Position.LONG, execution_price)
                 reward += open_reward
                 info.update(open_info)
             else:
@@ -353,13 +371,13 @@ class TradingEnv(gym.Env):
         
         elif action == Action.SHORT:
             if self.position == Position.LONG:
-                # Close long first
-                close_reward, _ = self._close_position(current_price)
+                # Close long first at next candle's open
+                close_reward, _ = self._close_position(execution_price)
                 reward += close_reward
             
             if self.position == Position.FLAT:
-                # Open short
-                open_reward, open_info = self._open_position(Position.SHORT, current_price)
+                # Open short at next candle's open
+                open_reward, open_info = self._open_position(Position.SHORT, execution_price)
                 reward += open_reward
                 info.update(open_info)
             else:
