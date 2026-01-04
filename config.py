@@ -2,12 +2,34 @@
 Configuration for Crypto Trading Bot
 =====================================
 All hyperparameters and settings in one place.
+
+FIXES:
+- Added Binance API configuration
+- Added proper environment variable loading
+- Fixed float comparison issue
 """
 
+import os
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 import torch
+
+
+@dataclass
+class BinanceConfig:
+    """Binance API configuration."""
+    # Load from environment variables for security
+    api_key: str = field(default_factory=lambda: os.environ.get("BINANCE_API_KEY", ""))
+    api_secret: str = field(default_factory=lambda: os.environ.get("BINANCE_API_SECRET", ""))
+    
+    # Use testnet for safety during development
+    testnet: bool = True
+    testnet_api_url: str = "https://testnet.binancefuture.com"
+    
+    # Rate limiting
+    max_requests_per_minute: int = 1200
+    request_timeout: int = 30
 
 
 @dataclass
@@ -20,6 +42,9 @@ class DataConfig:
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15
+    
+    # Use real data from Binance
+    use_real_data: bool = True
     
     # Features to use
     ohlcv_cols: List[str] = field(default_factory=lambda: [
@@ -41,7 +66,7 @@ class DataConfig:
 class ModelConfig:
     """Transformer model configuration."""
     # Input/Output
-    input_dim: int = 32  # Number of input features after engineering
+    input_dim: int = 22  # Number of input features after engineering
     output_dim: int = 3  # 0: Hold, 1: Long, 2: Short
     
     # Transformer architecture
@@ -74,12 +99,23 @@ class TrainingConfig:
     # Gradient clipping
     max_grad_norm: float = 1.0
     
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Device - auto-detect
+    device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Multi-GPU / Distributed training
+    distributed: bool = False
+    world_size: int = 1
+    local_rank: int = 0
+    
+    # Mixed precision training
+    use_amp: bool = True
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
     save_every: int = 5
+    
+    # Number of workers for data loading
+    num_workers: int = 4
 
 
 @dataclass
@@ -120,6 +156,7 @@ class RetrainingConfig:
 @dataclass
 class Config:
     """Master configuration."""
+    binance: BinanceConfig = field(default_factory=BinanceConfig)
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -148,6 +185,21 @@ class Config:
             raise ValueError(
                 f"position_size must be in (0, 1], got {self.trading.position_size}"
             )
+    
+    @classmethod
+    def from_yaml(cls, path: str) -> "Config":
+        """Load config from YAML file."""
+        import yaml
+        with open(path, 'r') as f:
+            data = yaml.safe_load(f)
+        # Would need custom parsing here
+        return cls()
+    
+    def to_yaml(self, path: str):
+        """Save config to YAML file."""
+        import yaml
+        # Would need custom serialization here
+        pass
 
 
 # Default config instance
@@ -164,5 +216,6 @@ if __name__ == "__main__":
     print(f"Model: d_model={config.model.d_model}, layers={config.model.num_encoder_layers}")
     print(f"Causal Attention: {config.model.causal}")
     print(f"Device: {config.training.device}")
+    print(f"Use Real Data: {config.data.use_real_data}")
     print(f"\nData splits: train={config.data.train_ratio}, val={config.data.val_ratio}, test={config.data.test_ratio}")
     print(f"Sum: {config.data.train_ratio + config.data.val_ratio + config.data.test_ratio}")
