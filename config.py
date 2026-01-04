@@ -4,6 +4,7 @@ Configuration for Crypto Trading Bot
 All hyperparameters and settings in one place.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional
 import torch
@@ -130,9 +131,23 @@ class Config:
     
     def __post_init__(self):
         """Validate configuration."""
-        assert self.data.train_ratio + self.data.val_ratio + self.data.test_ratio == 1.0
-        assert self.model.d_model % self.model.nhead == 0
-        assert 0 < self.trading.position_size <= 1.0
+        # Use math.isclose for float comparison to avoid floating point issues
+        total_ratio = self.data.train_ratio + self.data.val_ratio + self.data.test_ratio
+        if not math.isclose(total_ratio, 1.0, rel_tol=1e-9):
+            raise ValueError(
+                f"Data split ratios must sum to 1.0, got {total_ratio} "
+                f"({self.data.train_ratio} + {self.data.val_ratio} + {self.data.test_ratio})"
+            )
+        
+        if self.model.d_model % self.model.nhead != 0:
+            raise ValueError(
+                f"d_model ({self.model.d_model}) must be divisible by nhead ({self.model.nhead})"
+            )
+        
+        if not (0 < self.trading.position_size <= 1.0):
+            raise ValueError(
+                f"position_size must be in (0, 1], got {self.trading.position_size}"
+            )
 
 
 # Default config instance
@@ -144,6 +159,10 @@ if __name__ == "__main__":
     config = Config()
     print("=== Crypto Bot Configuration ===")
     print(f"Symbol: {config.data.symbol}")
+    print(f"Interval: {config.data.interval}")
+    print(f"Lookback: {config.data.lookback_window}")
     print(f"Model: d_model={config.model.d_model}, layers={config.model.num_encoder_layers}")
     print(f"Causal Attention: {config.model.causal}")
     print(f"Device: {config.training.device}")
+    print(f"\nData splits: train={config.data.train_ratio}, val={config.data.val_ratio}, test={config.data.test_ratio}")
+    print(f"Sum: {config.data.train_ratio + config.data.val_ratio + config.data.test_ratio}")
