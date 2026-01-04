@@ -329,6 +329,19 @@ class TradingEnv(gym.Env):
             truncated = False
             observation = self._get_observation()
             info['termination_reason'] = 'end_of_data'
+            
+            # Add final trading metrics
+            info['balance'] = self.balance
+            info['total_return'] = (self.balance - self.episode_start_balance) / self.episode_start_balance
+            info['initial_balance'] = self.episode_start_balance
+            info['num_trades'] = len(self.trades)
+            
+            if self.trades:
+                pnls = [t['pnl'] for t in self.trades]
+                winning = sum(1 for pnl in pnls if pnl > 0)
+                info['win_rate'] = winning / len(self.trades) if self.trades else 0.0
+                info['avg_trade_pnl'] = np.mean(pnls) if pnls else 0.0
+            
             return observation, reward, terminated, truncated, info
         
         # CRITICAL: Execute at NEXT candle's open (no lookahead!)
@@ -406,6 +419,17 @@ class TradingEnv(gym.Env):
         # Add final info
         info['balance'] = self.balance
         info['total_return'] = (self.balance - self.episode_start_balance) / self.episode_start_balance
+        
+        # Add trading metrics when episode ends
+        if terminated or truncated:
+            info['initial_balance'] = self.episode_start_balance
+            info['num_trades'] = len(self.trades)
+            
+            if self.trades:
+                pnls = [t['pnl'] for t in self.trades]
+                winning = sum(1 for pnl in pnls if pnl > 0)
+                info['win_rate'] = winning / len(self.trades) if self.trades else 0.0
+                info['avg_trade_pnl'] = np.mean(pnls) if pnls else 0.0
         
         return observation, reward, terminated, truncated, info
     
