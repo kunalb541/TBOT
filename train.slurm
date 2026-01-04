@@ -1,125 +1,192 @@
 #!/bin/bash
-#SBATCH --job-name=crypto_bot
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
-#SBATCH --nodes=1
+#SBATCH -p gpu_a100_short
+#SBATCH -N 2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
-#SBATCH --partition=gpu
+#SBATCH --mem-per-gpu=94000mb
+#SBATCH --cpus-per-gpu=12
+#SBATCH -t 00:30:00
+#SBATCH -o logs/crypto_train_%j.out
+#SBATCH -e logs/crypto_train_%j.err
+#SBATCH --job-name=crypto_bot
+#SBATCH --exclusive
+#SBATCH --signal=B:USR1@120
 
 # ============================================================================
-# SLURM Job Script for Crypto Trading Bot Training
+# SLURM Job Script for Crypto Trading Bot Training on bw3.0 HPC
 # ============================================================================
-# 
-# Usage:
-#   Single GPU:   sbatch --gres=gpu:1 train_hpc.slurm
-#   Multi GPU:    sbatch --gres=gpu:4 train_hpc.slurm
-#   Multi Node:   sbatch --nodes=2 --gres=gpu:4 train_hpc.slurm
 #
-# Adjust the partition name to match your cluster!
-# Common names: gpu, a100, v100, p100, nvidia
+# Usage:
+#   Single node (4 GPUs):   sbatch --nodes=1 train.slurm
+#   Multi node (8 GPUs):    sbatch --nodes=2 train.slurm
+#   Max scale (48 GPUs):    sbatch --nodes=12 train.slurm
+#
+# Partition: gpu_a100_short
+#   - GPU nodes with Ice Lake + NVIDIA A100 x4
+#   - mem-per-gpu=94000mb, cpus-per-gpu=12
+#   - Max time=30min, Max nodes=12
 # ============================================================================
+
+set -euo pipefail
 
 echo "============================================"
 echo "Job ID: $SLURM_JOB_ID"
-echo "Node: $SLURM_NODELIST"
-echo "GPUs: $SLURM_GPUS_ON_NODE"
+echo "Node list: $SLURM_NODELIST"
+echo "Number of nodes: $SLURM_NNODES"
+echo "GPUs per node: 4"
+echo "Total GPUs: $((SLURM_NNODES * 4))"
 echo "Start time: $(date)"
 echo "============================================"
 
-# Load required modules (adjust to your cluster)
-# Common module names:
-module load python/3.10 2>/dev/null || true
-module load cuda/12.1 2>/dev/null || true
-module load cudnn/8.9 2>/dev/null || true
-module load nccl 2>/dev/null || true
+# =============================================================================
+# ENVIRONMENT SETUP
+# =============================================================================
 
-# Alternatively, if using conda:
-# source /path/to/miniconda3/etc/profile.d/conda.sh
-# conda activate crypto_bot
-
-# Create log directory
-mkdir -p logs
+# Load conda environment
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate crypto_bot 2>/dev/null || {
+    echo "Creating crypto_bot environment..."
+    conda create -n crypto_bot python=3.10 -y
+    conda activate crypto_bot
+    pip install torch numpy pandas tqdm requests
+}
 
 # Navigate to project directory
-cd $SLURM_SUBMIT_DIR
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
-# Set environment variables for distributed training
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=29500
-export WORLD_SIZE=$((SLURM_NNODES * SLURM_GPUS_ON_NODE))
+# Create directories
+mkdir -p logs checkpoints
 
-# For better NCCL performance
-export NCCL_DEBUG=INFO
-export NCCL_IB_DISABLE=0
-export NCCL_NET_GDR_LEVEL=2
+# =============================================================================
+# ENVIRONMENT VARIABLES
+# =============================================================================
 
-# PyTorch settings
-export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+# Thread settings - avoid oversubscription
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMBA_NUM_THREADS=1
+
+# Python settings
 export PYTHONUNBUFFERED=1
+export PYTHONWARNINGS="ignore"
 
-echo "Master address: $MASTER_ADDR"
-echo "Master port: $MASTER_PORT"
-echo "World size: $WORLD_SIZE"
+# NCCL settings for multi-node
+export NCCL_DEBUG=WARN
+export NCCL_IB_DISABLE=0
+export NCCL_NET_GDR_LEVEL=3
 
-# ============================================================================
-# Training Configuration
-# ============================================================================
-N_CANDLES=${N_CANDLES:-10000}          # Number of candles
-BATCH_SIZE=${BATCH_SIZE:-64}           # Batch size per GPU
-EPOCHS=${EPOCHS:-100}                   # Number of epochs
-LEARNING_RATE=${LR:-1e-4}              # Learning rate
-SYMBOL=${SYMBOL:-BTCUSDT}              # Trading symbol
-USE_REAL_DATA=${USE_REAL_DATA:-true}   # Use real Binance data
+# PyTorch distributed settings (use TORCH_ prefix for PyTorch 2.0+)
+export TORCH_DISTRIBUTED_DEBUG=OFF
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export TORCH_NCCL_BLOCKING_WAIT=1
+
+# Remove deprecated variables
+unset NCCL_ASYNC_ERROR_HANDLING 2>/dev/null || true
+unset NCCL_BLOCKING_WAIT 2>/dev/null || true
+
+# Distributed training setup
+export LOCAL_WORLD_SIZE=4
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_NODELIST" | head -n 1)
+export MASTER_PORT=${MASTER_PORT:-29500}
 
 echo ""
+echo "Distributed Setup:"
+echo "  MASTER_ADDR: $MASTER_ADDR"
+echo "  MASTER_PORT: $MASTER_PORT"
+echo "  LOCAL_WORLD_SIZE: $LOCAL_WORLD_SIZE"
+echo "  Total GPUs: $((SLURM_NNODES * LOCAL_WORLD_SIZE))"
+echo ""
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+
+N_CANDLES=${N_CANDLES:-10000}
+BATCH_SIZE=${BATCH_SIZE:-64}
+EPOCHS=${EPOCHS:-100}
+LEARNING_RATE=${LR:-1e-4}
+SYMBOL=${SYMBOL:-BTCUSDT}
+USE_REAL_DATA=${USE_REAL_DATA:-true}
+
 echo "Training Configuration:"
 echo "  Candles: $N_CANDLES"
 echo "  Batch size: $BATCH_SIZE"
 echo "  Epochs: $EPOCHS"
+echo "  Learning rate: $LEARNING_RATE"
 echo "  Symbol: $SYMBOL"
 echo "  Use real data: $USE_REAL_DATA"
 echo ""
 
-# ============================================================================
-# Run Training
-# ============================================================================
+# =============================================================================
+# SIGNAL HANDLING
+# =============================================================================
 
-if [ $WORLD_SIZE -gt 1 ]; then
-    echo "Starting distributed training with $WORLD_SIZE GPUs..."
+handle_preemption() {
+    echo "[$(date)] Received preemption signal (USR1)"
+    echo "Saving checkpoint and exiting gracefully..."
+    # The Python script handles SIGTERM for graceful shutdown
+    exit 0
+}
+trap handle_preemption USR1
+
+cleanup() {
+    echo "[$(date)] Cleaning up..."
+    # Kill any remaining processes
+    pkill -f "torchrun.*main.py" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# =============================================================================
+# RUN TRAINING
+# =============================================================================
+
+echo "============================================"
+echo "Starting Training"
+echo "============================================"
+
+if [ "$SLURM_NNODES" -gt 1 ]; then
+    echo "Multi-node distributed training with $SLURM_NNODES nodes..."
     
-    # Use torchrun for distributed training
-    srun torchrun \
-        --nnodes=$SLURM_NNODES \
-        --nproc_per_node=$SLURM_GPUS_ON_NODE \
-        --rdzv_id=$SLURM_JOB_ID \
-        --rdzv_backend=c10d \
-        --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
-        main.py train \
-        --candles $N_CANDLES \
-        --symbol $SYMBOL
+    srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 \
+        torchrun \
+            --nnodes=$SLURM_NNODES \
+            --nproc_per_node=$LOCAL_WORLD_SIZE \
+            --rdzv_id="crypto-${SLURM_JOB_ID}" \
+            --rdzv_backend=c10d \
+            --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+            main.py train \
+                --candles $N_CANDLES \
+                --symbol $SYMBOL
 else
-    echo "Starting single GPU training..."
+    echo "Single-node training with 4 GPUs..."
     
-    python main.py train \
-        --candles $N_CANDLES \
-        --symbol $SYMBOL
+    torchrun \
+        --standalone \
+        --nproc_per_node=$LOCAL_WORLD_SIZE \
+        main.py train \
+            --candles $N_CANDLES \
+            --symbol $SYMBOL
 fi
 
-# ============================================================================
-# Post-training
-# ============================================================================
+TRAIN_EXIT_CODE=$?
+
+# =============================================================================
+# POST-TRAINING
+# =============================================================================
 
 echo ""
 echo "============================================"
-echo "Job finished at: $(date)"
+echo "Training Complete"
+echo "Exit code: $TRAIN_EXIT_CODE"
+echo "End time: $(date)"
 echo "============================================"
 
-# Copy checkpoints to a permanent location if needed
-# cp -r checkpoints/ /path/to/permanent/storage/
+# Run backtest if training succeeded
+if [ $TRAIN_EXIT_CODE -eq 0 ] && [ -f "checkpoints/final_model.pt" ]; then
+    echo ""
+    echo "Running backtest..."
+    python main.py backtest --checkpoint checkpoints/final_model.pt
+fi
 
-# Optional: Run quick evaluation
-# python main.py backtest
+exit $TRAIN_EXIT_CODE
