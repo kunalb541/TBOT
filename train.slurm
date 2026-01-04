@@ -43,16 +43,8 @@ echo "============================================"
 # =============================================================================
 # ENVIRONMENT SETUP
 # =============================================================================
-
-# Load conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate crypto_bot 2>/dev/null || {
-    echo "Creating crypto_bot environment..."
-    conda create -n crypto_bot python=3.10 -y
-    conda activate crypto_bot
-    pip install torch>=2.0.0 numpy>=1.24.0 pandas>=2.0.0 tqdm>=4.65.0 requests>=2.28.0
-}
-
+conda activate bot
 # Navigate to project directory
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
@@ -184,12 +176,14 @@ cleanup_tmp() {
         echo \"Node \$(hostname): /tmp cleaned\"
     "
 }
-
-cleanup_shm() {
-    log_info "Cleaning /dev/shm..."
-    srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -c "
-        rm -f /dev/shm/job${SLURM_JOB_ID}* 2>/dev/null || true
-        echo \"Node \$(hostname): /dev/shm cleaned\"
+# Check for latest checkpoint (prioritize numbered checkpoints, then best)
+if ls checkpoints/checkpoint_epoch_*.pt 1> /dev/null 2>&1; then
+    LATEST_CHECKPOINT=$(ls -t checkpoints/checkpoint_epoch_*.pt | head -1)
+elif [[ -f "checkpoints/best_model.pt" ]]; then
+    LATEST_CHECKPOINT="checkpoints/best_model.pt"
+else
+    LATEST_CHECKPOINT=""
+fi
     "
 }
 
@@ -355,13 +349,15 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
         log_info "Backtest results: backtest_results.json"
         python3 -c "
 import json
-with open('backtest_results.json') as f:
-    results = json.load(f)
-print(f'  Total Return: {results[\"total_return_pct\"]:.2f}%')
-print(f'  Win Rate: {results[\"win_rate\"]*100:.1f}%')
-print(f'  Sharpe Ratio: {results[\"sharpe_ratio\"]:.2f}')
-print(f'  Max Drawdown: {results[\"max_drawdown_pct\"]:.2f}%')
-" || true
+try:
+    with open('backtest_results.json') as f:
+        results = json.load(f)
+    print(f"  Total Return: {results['total_return_pct']:.2f}%")
+    print(f"  Win Rate: {results['win_rate']*100:.1f}%")
+    print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
+    print(f"  Max Drawdown: {results['max_drawdown_pct']:.2f}%")
+except Exception as e:
+    print(f"  Error reading results: {e}")
     fi
 else
     log_error "Training failed with exit code $TRAIN_EXIT_CODE"
