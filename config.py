@@ -7,6 +7,7 @@ FIXES:
 - Added Binance API configuration
 - Added proper environment variable loading
 - Fixed float comparison issue
+- Fixed num_workers for HPC compatibility
 """
 
 import os
@@ -115,7 +116,8 @@ class TrainingConfig:
     save_every: int = 5
     
     # Number of workers for data loading
-    num_workers: int = 4
+    # Set to 0 for HPC to avoid issues with distributed training
+    num_workers: int = 0
 
 
 @dataclass
