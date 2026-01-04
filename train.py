@@ -15,6 +15,12 @@ ENHANCEMENTS:
 - Automatic Mixed Precision (AMP) for faster training
 - Gradient accumulation for effective larger batch sizes
 - Better logging and progress tracking
+
+FIXES:
+- Updated autocast import for PyTorch 2.0+
+- Fixed NCCL environment variables
+- Better error handling for distributed training
+- Fixed GradScaler import for PyTorch 2.0+
 """
 
 import os
@@ -22,6 +28,7 @@ import sys
 import json
 import time
 import logging
+import signal
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -34,7 +41,16 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+
+# PyTorch 2.0+ compatible imports for AMP
+try:
+    from torch.amp import GradScaler, autocast
+    AMP_DEVICE_TYPE = "cuda"
+except ImportError:
+    # Fallback for older PyTorch versions
+    from torch.cuda.amp import GradScaler, autocast
+    AMP_DEVICE_TYPE = None
+
 from tqdm import tqdm
 import numpy as np
 
@@ -49,6 +65,16 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+# Global flag for graceful shutdown
+_SHUTDOWN_FLAG = False
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    global _SHUTDOWN_FLAG
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    _SHUTDOWN_FLAG = True
 
 
 class EarlyStopping:
@@ -124,7 +150,15 @@ def setup_distributed():
         rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
         
-        dist.init_process_group(backend='nccl')
+        # Initialize process group
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+        
         torch.cuda.set_device(local_rank)
         
         logger.info(f"Distributed training: rank {rank}/{world_size}, local_rank {local_rank}")
@@ -171,14 +205,19 @@ def train_epoch(
         avg_loss: Average loss over the epoch
         accuracy: Classification accuracy
     """
+    global _SHUTDOWN_FLAG
+    
     model.train()
     total_loss = 0.0
     correct = 0
     total = 0
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1} Train", leave=False)
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1} Train", leave=False, disable=not is_main_process(0))
     
     for batch_idx, (sequences, labels, _) in enumerate(pbar):
+        if _SHUTDOWN_FLAG:
+            break
+            
         sequences = sequences.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
@@ -186,9 +225,15 @@ def train_epoch(
         
         # Forward pass with optional AMP
         if scaler is not None and config.training.use_amp:
-            with autocast():
-                logits = model(sequences)
-                loss = criterion(logits, labels)
+            # PyTorch 2.0+ compatible autocast
+            if AMP_DEVICE_TYPE:
+                with autocast(device_type=AMP_DEVICE_TYPE):
+                    logits = model(sequences)
+                    loss = criterion(logits, labels)
+            else:
+                with autocast():
+                    logits = model(sequences)
+                    loss = criterion(logits, labels)
             
             # Backward pass with scaling
             scaler.scale(loss).backward()
@@ -218,8 +263,8 @@ def train_epoch(
             'acc': f'{correct/total:.4f}'
         })
     
-    avg_loss = total_loss / len(dataloader)
-    accuracy = correct / total
+    avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
     
     return avg_loss, accuracy
 
@@ -253,10 +298,15 @@ def validate(
         sequences = sequences.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        if config.training.use_amp:
-            with autocast():
-                logits = model(sequences)
-                loss = criterion(logits, labels)
+        if config.training.use_amp and torch.cuda.is_available():
+            if AMP_DEVICE_TYPE:
+                with autocast(device_type=AMP_DEVICE_TYPE):
+                    logits = model(sequences)
+                    loss = criterion(logits, labels)
+            else:
+                with autocast():
+                    logits = model(sequences)
+                    loss = criterion(logits, labels)
         else:
             logits = model(sequences)
             loss = criterion(logits, labels)
@@ -360,6 +410,12 @@ def train(
     Returns:
         Trained model and training metrics
     """
+    global _SHUTDOWN_FLAG
+    
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     # Setup distributed training
     is_distributed, world_size, rank, local_rank = setup_distributed()
     is_main = is_main_process(rank)
@@ -442,7 +498,7 @@ def train(
     
     # Wrap model for distributed training
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     # Compute class weights for imbalanced data
     class_weights = compute_class_weights(train_loader).to(device)
@@ -513,62 +569,79 @@ def train(
     
     best_val_loss = float('inf')
     
-    for epoch in range(start_epoch, config.training.epochs):
-        epoch_start = time.time()
-        
-        # Set epoch for distributed sampler
-        if is_distributed:
-            train_sampler.set_epoch(epoch)
-        
-        # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, config, device, scaler, epoch
-        )
-        
-        # Validate
-        val_loss, val_acc, class_accs = validate(
-            model, val_loader, criterion, device, config
-        )
-        
-        # Update scheduler
-        scheduler.step(val_loss)
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # Track metrics
-        epoch_time = time.time() - epoch_start
-        metrics.update(train_loss, val_loss, train_acc, val_acc, current_lr, epoch_time)
-        
-        # Print progress (main process only)
-        if is_main:
-            logger.info(f"\nEpoch {epoch + 1}/{config.training.epochs}")
-            logger.info(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-            logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-            logger.info(f"  Class Acc: Hold={class_accs[0]:.3f}, Long={class_accs[1]:.3f}, Short={class_accs[2]:.3f}")
-            logger.info(f"  LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+    try:
+        for epoch in range(start_epoch, config.training.epochs):
+            if _SHUTDOWN_FLAG:
+                logger.info("Shutdown flag detected, saving checkpoint...")
+                break
+                
+            epoch_start = time.time()
             
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_path = checkpoint_dir / "best_model.pt"
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, metrics, config,
-                    feature_names, scaler_stats, str(best_path), is_distributed
-                )
-                logger.info(f"  -> New best model saved!")
+            # Set epoch for distributed sampler
+            if is_distributed:
+                train_sampler.set_epoch(epoch)
             
-            # Periodic checkpoint
-            if (epoch + 1) % config.training.save_every == 0:
-                ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-                save_checkpoint(
-                    model, optimizer, scheduler, epoch, metrics, config,
-                    feature_names, scaler_stats, str(ckpt_path), is_distributed
-                )
-        
-        # Early stopping
-        if early_stopping(val_loss, model):
+            # Train
+            train_loss, train_acc = train_epoch(
+                model, train_loader, criterion, optimizer, config, device, scaler, epoch
+            )
+            
+            # Validate
+            val_loss, val_acc, class_accs = validate(
+                model, val_loader, criterion, device, config
+            )
+            
+            # Update scheduler
+            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Track metrics
+            epoch_time = time.time() - epoch_start
+            metrics.update(train_loss, val_loss, train_acc, val_acc, current_lr, epoch_time)
+            
+            # Print progress (main process only)
             if is_main:
-                logger.info(f"\nEarly stopping triggered at epoch {epoch + 1}")
-            break
+                logger.info(f"\nEpoch {epoch + 1}/{config.training.epochs}")
+                logger.info(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+                logger.info(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+                logger.info(f"  Class Acc: Hold={class_accs[0]:.3f}, Long={class_accs[1]:.3f}, Short={class_accs[2]:.3f}")
+                logger.info(f"  LR: {current_lr:.2e} | Time: {epoch_time:.1f}s")
+                
+                # Save best model
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_path = checkpoint_dir / "best_model.pt"
+                    save_checkpoint(
+                        model, optimizer, scheduler, epoch, metrics, config,
+                        feature_names, scaler_stats, str(best_path), is_distributed
+                    )
+                    logger.info(f"  -> New best model saved!")
+                
+                # Periodic checkpoint
+                if (epoch + 1) % config.training.save_every == 0:
+                    ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+                    save_checkpoint(
+                        model, optimizer, scheduler, epoch, metrics, config,
+                        feature_names, scaler_stats, str(ckpt_path), is_distributed
+                    )
+            
+            # Early stopping
+            if early_stopping(val_loss, model):
+                if is_main:
+                    logger.info(f"\nEarly stopping triggered at epoch {epoch + 1}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Training error: {e}")
+        # Save emergency checkpoint
+        if is_main:
+            emergency_path = checkpoint_dir / "emergency_checkpoint.pt"
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, metrics, config,
+                feature_names, scaler_stats, str(emergency_path), is_distributed
+            )
+            logger.info(f"Emergency checkpoint saved to {emergency_path}")
+        raise
     
     # Load best model
     if early_stopping.best_model_state is not None:
