@@ -14,7 +14,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -44,7 +44,8 @@ class EarlyStopping:
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
             self.counter = 0
-            self.best_model_state = model.state_dict().copy()
+            # Deep copy the model state
+            self.best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
             self.counter += 1
             if self.counter >= self.patience:
@@ -57,12 +58,12 @@ class TrainingMetrics:
     """Track training metrics."""
     
     def __init__(self):
-        self.train_losses = []
-        self.val_losses = []
-        self.train_accuracies = []
-        self.val_accuracies = []
-        self.learning_rates = []
-        self.epoch_times = []
+        self.train_losses: List[float] = []
+        self.val_losses: List[float] = []
+        self.train_accuracies: List[float] = []
+        self.val_accuracies: List[float] = []
+        self.learning_rates: List[float] = []
+        self.epoch_times: List[float] = []
     
     def update(
         self,
@@ -153,7 +154,7 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device
-) -> Tuple[float, float, Dict]:
+) -> Tuple[float, float, Dict[int, float]]:
     """
     Validate model.
     
@@ -189,8 +190,8 @@ def validate(
             class_correct[i] += (predictions[mask] == labels[mask]).sum().item()
             class_total[i] += mask.sum().item()
     
-    avg_loss = total_loss / len(dataloader)
-    accuracy = correct / total
+    avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
     
     class_accuracies = {}
     for i in range(3):
@@ -234,6 +235,7 @@ def save_checkpoint(
     epoch: int,
     metrics: TrainingMetrics,
     config: Config,
+    feature_names: List[str],
     path: str
 ):
     """Save training checkpoint."""
@@ -243,10 +245,8 @@ def save_checkpoint(
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'metrics': metrics.to_dict(),
-        'config': {
-            'model': config.model.__dict__,
-            'training': config.training.__dict__
-        }
+        'feature_names': feature_names,
+        'config': config.model.__dict__
     }
     torch.save(checkpoint, path)
 
@@ -258,7 +258,7 @@ def load_checkpoint(
     scheduler: Optional[ReduceLROnPlateau] = None
 ) -> Tuple[int, TrainingMetrics]:
     """Load training checkpoint."""
-    checkpoint = torch.load(path)
+    checkpoint = torch.load(path, weights_only=False)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -299,6 +299,8 @@ def train(
     # Set random seeds for reproducibility
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
     
     device = torch.device(config.training.device)
     print(f"\n=== Training Configuration ===")
@@ -309,7 +311,7 @@ def train(
     
     # Prepare data
     print("\n=== Preparing Data ===")
-    train_ds, val_ds, test_ds, feature_names = prepare_datasets(config, n_candles)
+    train_ds, val_ds, test_ds, feature_names, scaler_stats = prepare_datasets(config, n_candles)
     train_loader, val_loader, test_loader = create_dataloaders(
         train_ds, val_ds, test_ds, config
     )
@@ -403,13 +405,21 @@ def train(
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = checkpoint_dir / "best_model.pt"
-            torch.save(model.state_dict(), best_path)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': config.model.__dict__,
+                'feature_names': feature_names,
+                'scaler_mean': scaler_stats['mean'],
+                'scaler_std': scaler_stats['std'],
+                'val_loss': val_loss,
+                'val_acc': val_acc
+            }, best_path)
             print(f"  -> New best model saved!")
         
         # Periodic checkpoint
         if (epoch + 1) % config.training.save_every == 0:
             ckpt_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-            save_checkpoint(model, optimizer, scheduler, epoch, metrics, config, str(ckpt_path))
+            save_checkpoint(model, optimizer, scheduler, epoch, metrics, config, feature_names, str(ckpt_path))
         
         # Early stopping
         if early_stopping(val_loss, model):
@@ -429,12 +439,14 @@ def train(
     print(f"Test Accuracy: {test_acc:.4f}")
     print(f"Class Accuracies: Hold={test_class_accs[0]:.3f}, Long={test_class_accs[1]:.3f}, Short={test_class_accs[2]:.3f}")
     
-    # Save final model
+    # Save final model with all necessary info
     final_path = checkpoint_dir / "final_model.pt"
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': config.model.__dict__,
         'feature_names': feature_names,
+        'scaler_mean': scaler_stats['mean'],
+        'scaler_std': scaler_stats['std'],
         'test_metrics': {
             'loss': test_loss,
             'accuracy': test_acc,
