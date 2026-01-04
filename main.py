@@ -9,11 +9,13 @@ Usage:
     python main.py paper        # Run paper trading
     python main.py full         # Full pipeline
     python main.py demo         # Quick demo (no training)
+    python main.py test-data    # Test Binance data fetching
 """
 
 import sys
 import argparse
 import json
+import logging
 from pathlib import Path
 from datetime import datetime
 
@@ -25,7 +27,9 @@ from data import (
     prepare_datasets,
     create_dataloaders,
     CryptoDataFetcher,
-    compute_technical_indicators
+    BinanceDataFetcher,
+    compute_technical_indicators,
+    FEATURE_COLS
 )
 from model import (
     CausalTimeSeriesTransformer,
@@ -34,13 +38,56 @@ from model import (
 )
 from train import train, TrainingMetrics
 from backtest import Backtester, print_backtest_results
-from paper_trade import PaperTrader
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+def test_binance_data(config: Config):
+    """Test Binance data fetching."""
+    print("\n" + "="*60)
+    print("TESTING BINANCE DATA FETCH")
+    print("="*60)
+    
+    print("\n1. Testing direct Binance API fetch...")
+    fetcher = BinanceDataFetcher(config)
+    
+    # Test klines fetch
+    df = fetcher.fetch_klines("BTCUSDT", "1h", limit=100)
+    if df is not None:
+        print(f"   ✓ Successfully fetched {len(df)} candles")
+        print(f"   Time range: {df.index[0]} to {df.index[-1]}")
+        print(f"   Latest close: ${df['close'].iloc[-1]:,.2f}")
+    else:
+        print("   ✗ Failed to fetch data")
+        return
+    
+    print("\n2. Testing historical data fetch (pagination)...")
+    df = fetcher.fetch_historical("BTCUSDT", "1h", n_candles=2000)
+    print(f"   ✓ Successfully fetched {len(df)} candles")
+    print(f"   Time range: {df.index[0]} to {df.index[-1]}")
+    
+    print("\n3. Testing technical indicators...")
+    df = compute_technical_indicators(df, config)
+    df = df.dropna()
+    print(f"   ✓ Computed {len(FEATURE_COLS)} indicators")
+    print(f"   Valid samples after dropna: {len(df)}")
+    
+    print("\n4. Sample data:")
+    print(df[['close', 'rsi_normalized', 'macd_normalized', 'bb_position']].tail())
+    
+    print("\n" + "="*60)
+    print("DATA TEST COMPLETE")
+    print("="*60)
 
 
 def run_training(config: Config, n_candles: int = 8000):
-    """
-    Run model training.
-    """
+    """Run model training."""
     print("\n" + "="*60)
     print("TRAINING PHASE")
     print("="*60)
@@ -55,14 +102,11 @@ def run_training(config: Config, n_candles: int = 8000):
 
 
 def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model.pt"):
-    """
-    Run backtesting on test data.
-    """
+    """Run backtesting on test data."""
     print("\n" + "="*60)
     print("BACKTESTING PHASE")
     print("="*60)
     
-    # Check if checkpoint exists
     if not Path(checkpoint_path).exists():
         print(f"ERROR: Checkpoint not found at {checkpoint_path}")
         print("Please run training first: python main.py train")
@@ -93,16 +137,13 @@ def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model
         n_candles=3000
     )
     
-    # Compute indicators
     df = compute_technical_indicators(df, config)
     df = df.dropna()
     
-    # Get scaler statistics
     available_features = [f for f in feature_names if f in df.columns]
     if len(available_features) != len(feature_names):
         print(f"WARNING: Missing features: {set(feature_names) - set(available_features)}")
     
-    # Use saved scaler if available, otherwise compute from data
     if scaler_mean is None or scaler_std is None:
         print("WARNING: No saved scaler stats, computing from first 70% of data")
         features = df[available_features].values
@@ -111,9 +152,8 @@ def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model
         scaler_std = features[:train_end].std(axis=0)
         scaler_std = np.where(scaler_std < 1e-10, 1.0, scaler_std)
     
-    # Run backtest on last 30% (test period) - this simulates proper test evaluation
-    features = df[available_features].values
-    val_end = int(len(features) * 0.85)  # Use last 15% as test
+    # Use last 15% as test
+    val_end = int(len(df) * 0.85)
     test_df = df.iloc[val_end:]
     
     print(f"\nBacktest period: {test_df.index[0]} to {test_df.index[-1]}")
@@ -151,72 +191,8 @@ def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model
     return results
 
 
-def run_paper_trading(
-    config: Config,
-    checkpoint_path: str = "checkpoints/final_model.pt",
-    duration_minutes: int = 5
-):
-    """
-    Run paper trading simulation.
-    """
-    print("\n" + "="*60)
-    print("PAPER TRADING PHASE")
-    print("="*60)
-    
-    # Check if checkpoint exists
-    if not Path(checkpoint_path).exists():
-        print(f"ERROR: Checkpoint not found at {checkpoint_path}")
-        print("Please run training first: python main.py train")
-        return None
-    
-    # Load model
-    checkpoint = torch.load(checkpoint_path, map_location=config.training.device, weights_only=False)
-    
-    from config import ModelConfig
-    model_config = ModelConfig(**checkpoint['config'])
-    model = CausalTimeSeriesTransformer(model_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(config.training.device)
-    model.eval()
-    
-    feature_names = checkpoint['feature_names']
-    scaler_mean = checkpoint.get('scaler_mean')
-    scaler_std = checkpoint.get('scaler_std')
-    
-    print(f"Loaded model from: {checkpoint_path}")
-    print(f"Paper trading duration: {duration_minutes} minutes")
-    
-    # Create paper trader
-    trader = PaperTrader(
-        model=model,
-        config=config,
-        feature_names=feature_names,
-        scaler_mean=scaler_mean,
-        scaler_std=scaler_std
-    )
-    
-    # Run paper trading
-    trader.run(
-        duration_minutes=duration_minutes,
-        prediction_interval=30  # Predict every 30 seconds
-    )
-    
-    # Save session data
-    session_data = trader.get_session_data()
-    session_path = Path(f"paper_trading_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    
-    with open(session_path, 'w') as f:
-        json.dump(session_data, f, indent=2, default=str)
-    
-    print(f"\n✓ Session data saved to: {session_path}")
-    
-    return session_data
-
-
 def run_full_pipeline(config: Config):
-    """
-    Run the complete pipeline: Train → Backtest → Paper Trade
-    """
+    """Run the complete pipeline: Train → Backtest"""
     print("\n" + "#"*60)
     print("# CRYPTO TRADING BOT - FULL PIPELINE")
     print("#"*60)
@@ -227,37 +203,20 @@ def run_full_pipeline(config: Config):
     # Step 2: Backtesting
     results = run_backtest(config)
     
-    # Step 3: Paper Trading (short demo)
-    print("\nRunning paper trading demo for 2 minutes...")
-    session_data = run_paper_trading(config, duration_minutes=2)
-    
     print("\n" + "#"*60)
     print("# PIPELINE COMPLETE")
     print("#"*60)
     
-    return model, results, session_data
+    return model, results
 
 
 def quick_demo(config: Config):
-    """
-    Quick demo without training - just shows the system works.
-    """
+    """Quick demo without training."""
     print("\n" + "="*60)
     print("QUICK DEMO - No Training")
     print("="*60)
     
-    # Create random model
-    feature_names = [
-        'returns', 'log_returns', 'range_pct', 'body_pct',
-        'upper_wick', 'lower_wick',
-        'rsi_normalized', 'macd_normalized', 'macd_hist_normalized',
-        'bb_position', 'bb_width', 'atr_normalized',
-        'ema_9', 'ema_21', 'ema_50', 'ema_200',
-        'volume_normalized', 'volume_ratio',
-        'momentum_5', 'momentum_10', 'momentum_20',
-        'volatility_normalized'
-    ]
-    
+    feature_names = FEATURE_COLS
     config.model.input_dim = len(feature_names)
     model = CausalTimeSeriesTransformer(config.model)
     model.to(config.training.device)
@@ -267,17 +226,19 @@ def quick_demo(config: Config):
     # Verify causal masking
     print("\nVerifying causal masking...")
     is_causal = verify_causal_masking(model, seq_len=20)
-    if not is_causal:
-        print("WARNING: Causal masking verification failed!")
     
-    # Generate some fake data
-    print("\nGenerating fake price data...")
-    from data import generate_fake_ohlcv
-    df = generate_fake_ohlcv(n_candles=1000, seed=config.seed)
+    # Fetch real data
+    print("\nFetching data...")
+    fetcher = CryptoDataFetcher(config)
+    df = fetcher.fetch_historical(
+        symbol=config.data.symbol,
+        interval=config.data.interval,
+        n_candles=1000
+    )
     df = compute_technical_indicators(df, config)
     df = df.dropna()
     
-    print(f"Generated {len(df)} candles with {len(feature_names)} features")
+    print(f"Fetched {len(df)} candles with {len(feature_names)} features")
     
     # Quick backtest
     print("\nRunning quick backtest with random model...")
@@ -303,10 +264,10 @@ def main():
     )
     parser.add_argument(
         'mode',
-        choices=['train', 'backtest', 'paper', 'full', 'demo'],
+        choices=['train', 'backtest', 'full', 'demo', 'test-data'],
         nargs='?',
         default='demo',
-        help='Mode to run: train, backtest, paper (paper trading), full (complete pipeline), demo (quick test)'
+        help='Mode to run'
     )
     parser.add_argument(
         '--checkpoint',
@@ -321,12 +282,6 @@ def main():
         help='Number of candles for training'
     )
     parser.add_argument(
-        '--duration',
-        type=int,
-        default=5,
-        help='Paper trading duration in minutes'
-    )
-    parser.add_argument(
         '--symbol',
         type=str,
         default='BTCUSDT',
@@ -336,7 +291,12 @@ def main():
         '--device',
         type=str,
         default=None,
-        help='Device to use (cuda/cpu). Auto-detect if not specified.'
+        help='Device to use (cuda/cpu)'
+    )
+    parser.add_argument(
+        '--fake-data',
+        action='store_true',
+        help='Use fake data instead of real Binance data'
     )
     
     args = parser.parse_args()
@@ -344,6 +304,7 @@ def main():
     # Create configuration
     config = Config()
     config.data.symbol = args.symbol
+    config.data.use_real_data = not args.fake_data
     
     if args.device:
         config.training.device = args.device
@@ -354,6 +315,7 @@ def main():
     print(f"Interval: {config.data.interval}")
     print(f"Lookback: {config.data.lookback_window}")
     print(f"Device: {config.training.device}")
+    print(f"Use Real Data: {config.data.use_real_data}")
     
     # Check CUDA availability
     if config.training.device == "cuda" and not torch.cuda.is_available():
@@ -361,18 +323,14 @@ def main():
         config.training.device = "cpu"
     
     # Run selected mode
-    if args.mode == 'train':
+    if args.mode == 'test-data':
+        test_binance_data(config)
+    
+    elif args.mode == 'train':
         run_training(config, n_candles=args.candles)
     
     elif args.mode == 'backtest':
         run_backtest(config, checkpoint_path=args.checkpoint)
-    
-    elif args.mode == 'paper':
-        run_paper_trading(
-            config,
-            checkpoint_path=args.checkpoint,
-            duration_minutes=args.duration
-        )
     
     elif args.mode == 'full':
         run_full_pipeline(config)
