@@ -134,16 +134,10 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         position = observations['position']
         position_value = observations['position_value']
         
-        # FIXED: Robust handling of position_value dimensions
-        # Always ensure it's (batch, 1)
-        while position_value.dim() > 2:
-            position_value = position_value.squeeze(-1)
+        # Get batch size from market_data
+        batch_size = market_data.shape[0]
         
-        if position_value.dim() == 1:
-            position_value = position_value.unsqueeze(-1)
-        
-        # At this point, position_value should be (batch, 1)
-        
+        # FIXED: Ensure all tensors are properly shaped for concatenation
         # Project market data
         x = self.input_proj(market_data)
         
@@ -160,13 +154,56 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         # Use last position output (most recent state)
         x = x[:, -1, :]  # (batch, d_model)
         
+        # Handle position tensor - ensure it's 1D with batch_size elements
+        if position.dim() == 0:
+            # Scalar - expand to batch
+            position = position.unsqueeze(0).expand(batch_size)
+        elif position.dim() > 1:
+            # Multi-dimensional - flatten to 1D
+            position = position.reshape(-1)
+        
+        # Ensure position has exactly batch_size elements
+        if position.shape[0] != batch_size:
+            # Take first batch_size elements or repeat if needed
+            if position.shape[0] > batch_size:
+                position = position[:batch_size]
+            else:
+                position = position.repeat((batch_size + position.shape[0] - 1) // position.shape[0])[:batch_size]
+        
         # Embed position state
-        # Handle position being 2D from vectorized envs
-        if position.dim() > 1:
-            position = position.squeeze(-1)
         pos_embed = self.position_embed(position.long())  # (batch, 32)
         
-        # Combine all features (all should be (batch, feature_dim) now)
+        # Handle position_value tensor - ensure it's (batch, 1)
+        if position_value.dim() == 0:
+            # Scalar - expand to (batch, 1)
+            position_value = position_value.unsqueeze(0).unsqueeze(0).expand(batch_size, 1)
+        elif position_value.dim() == 1:
+            # 1D - add feature dimension
+            if position_value.shape[0] == batch_size:
+                position_value = position_value.unsqueeze(-1)  # (batch, 1)
+            else:
+                # Wrong size - reshape and adjust
+                position_value = position_value.reshape(-1, 1)[:batch_size]
+        elif position_value.dim() == 2:
+            # Already 2D - verify and adjust shape
+            if position_value.shape[0] != batch_size:
+                position_value = position_value.reshape(-1, 1)[:batch_size]
+            if position_value.shape[1] != 1:
+                position_value = position_value[:, :1]  # Take first column
+        else:
+            # 3D or higher - flatten to (batch, 1)
+            position_value = position_value.reshape(batch_size, -1)[:, :1]
+        
+        # Final safety check - ensure (batch, 1)
+        if position_value.shape != (batch_size, 1):
+            position_value = position_value.reshape(batch_size, 1)
+        
+        # Now all tensors should be 2D with shape (batch, feature_dim)
+        # x: (batch, d_model)
+        # pos_embed: (batch, 32)
+        # position_value: (batch, 1)
+        
+        # Combine all features
         combined = torch.cat([x, pos_embed, position_value], dim=-1)
         features = self.feature_combine(combined)
         
@@ -372,20 +409,22 @@ class PretrainedTransformerPolicy(nn.Module):
         position = observations['position']
         position_value = observations['position_value']
         
+        batch_size = market_data.shape[0]
+        
         # Get transformer features
-        # Note: transformer expects (batch, seq, features)
         transformer_out = self.transformer(market_data, return_all_positions=False)
         
-        # Add position info
+        # Handle position
         if position.dim() > 1:
-            position = position.squeeze(-1)
+            position = position.reshape(-1)
+        if position.shape[0] != batch_size:
+            position = position[:batch_size] if position.shape[0] > batch_size else position.repeat((batch_size + position.shape[0] - 1) // position.shape[0])[:batch_size]
+        
         pos_embed = self.position_embed(position.long())
         
-        # Ensure position_value is 2D
-        while position_value.dim() > 2:
-            position_value = position_value.squeeze(-1)
-        if position_value.dim() == 1:
-            position_value = position_value.unsqueeze(-1)
+        # Handle position_value
+        if position_value.dim() != 2 or position_value.shape != (batch_size, 1):
+            position_value = position_value.reshape(batch_size, -1)[:, :1]
         
         combined = torch.cat([transformer_out, pos_embed, position_value], dim=-1)
         
