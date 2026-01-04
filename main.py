@@ -8,6 +8,7 @@ Usage:
     python main.py backtest     # Run backtest
     python main.py paper        # Run paper trading
     python main.py full         # Full pipeline
+    python main.py demo         # Quick demo (no training)
 """
 
 import sys
@@ -61,8 +62,14 @@ def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model
     print("BACKTESTING PHASE")
     print("="*60)
     
+    # Check if checkpoint exists
+    if not Path(checkpoint_path).exists():
+        print(f"ERROR: Checkpoint not found at {checkpoint_path}")
+        print("Please run training first: python main.py train")
+        return None
+    
     # Load model
-    checkpoint = torch.load(checkpoint_path, map_location=config.training.device)
+    checkpoint = torch.load(checkpoint_path, map_location=config.training.device, weights_only=False)
     
     from config import ModelConfig
     model_config = ModelConfig(**checkpoint['config'])
@@ -72,31 +79,45 @@ def run_backtest(config: Config, checkpoint_path: str = "checkpoints/final_model
     model.eval()
     
     feature_names = checkpoint['feature_names']
+    scaler_mean = checkpoint.get('scaler_mean')
+    scaler_std = checkpoint.get('scaler_std')
     
     print(f"Loaded model from: {checkpoint_path}")
     print(f"Features: {len(feature_names)}")
     
-    # Fetch data for backtesting
+    # Fetch fresh data for backtesting
     fetcher = CryptoDataFetcher(config)
     df = fetcher.fetch_historical(
         symbol=config.data.symbol,
         interval=config.data.interval,
-        n_candles=3000  # Last 3000 candles for backtest
+        n_candles=3000
     )
     
     # Compute indicators
     df = compute_technical_indicators(df, config)
     df = df.dropna()
     
-    # Get scaler statistics from first 70% (simulating train data)
+    # Get scaler statistics
     available_features = [f for f in feature_names if f in df.columns]
-    features = df[available_features].values
-    train_end = int(len(features) * 0.7)
-    scaler_mean = features[:train_end].mean(axis=0)
-    scaler_std = features[:train_end].std(axis=0)
+    if len(available_features) != len(feature_names):
+        print(f"WARNING: Missing features: {set(feature_names) - set(available_features)}")
     
-    # Run backtest on last 30% (test period)
-    test_df = df.iloc[train_end:]
+    # Use saved scaler if available, otherwise compute from data
+    if scaler_mean is None or scaler_std is None:
+        print("WARNING: No saved scaler stats, computing from first 70% of data")
+        features = df[available_features].values
+        train_end = int(len(features) * 0.7)
+        scaler_mean = features[:train_end].mean(axis=0)
+        scaler_std = features[:train_end].std(axis=0)
+        scaler_std = np.where(scaler_std < 1e-10, 1.0, scaler_std)
+    
+    # Run backtest on last 30% (test period) - this simulates proper test evaluation
+    features = df[available_features].values
+    val_end = int(len(features) * 0.85)  # Use last 15% as test
+    test_df = df.iloc[val_end:]
+    
+    print(f"\nBacktest period: {test_df.index[0]} to {test_df.index[-1]}")
+    print(f"Backtest samples: {len(test_df)}")
     
     backtester = Backtester(config)
     results = backtester.run(
@@ -142,8 +163,14 @@ def run_paper_trading(
     print("PAPER TRADING PHASE")
     print("="*60)
     
+    # Check if checkpoint exists
+    if not Path(checkpoint_path).exists():
+        print(f"ERROR: Checkpoint not found at {checkpoint_path}")
+        print("Please run training first: python main.py train")
+        return None
+    
     # Load model
-    checkpoint = torch.load(checkpoint_path, map_location=config.training.device)
+    checkpoint = torch.load(checkpoint_path, map_location=config.training.device, weights_only=False)
     
     from config import ModelConfig
     model_config = ModelConfig(**checkpoint['config'])
@@ -153,6 +180,8 @@ def run_paper_trading(
     model.eval()
     
     feature_names = checkpoint['feature_names']
+    scaler_mean = checkpoint.get('scaler_mean')
+    scaler_std = checkpoint.get('scaler_std')
     
     print(f"Loaded model from: {checkpoint_path}")
     print(f"Paper trading duration: {duration_minutes} minutes")
@@ -161,7 +190,9 @@ def run_paper_trading(
     trader = PaperTrader(
         model=model,
         config=config,
-        feature_names=feature_names
+        feature_names=feature_names,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std
     )
     
     # Run paper trading
@@ -235,23 +266,26 @@ def quick_demo(config: Config):
     
     # Verify causal masking
     print("\nVerifying causal masking...")
-    verify_causal_masking(model, seq_len=20)
+    is_causal = verify_causal_masking(model, seq_len=20)
+    if not is_causal:
+        print("WARNING: Causal masking verification failed!")
     
     # Generate some fake data
     print("\nGenerating fake price data...")
     from data import generate_fake_ohlcv
-    df = generate_fake_ohlcv(n_candles=1000)
+    df = generate_fake_ohlcv(n_candles=1000, seed=config.seed)
     df = compute_technical_indicators(df, config)
     df = df.dropna()
     
     print(f"Generated {len(df)} candles with {len(feature_names)} features")
     
     # Quick backtest
-    print("\nRunning quick backtest...")
+    print("\nRunning quick backtest with random model...")
     available_features = [f for f in feature_names if f in df.columns]
     features = df[available_features].values
     mean = features.mean(axis=0)
     std = features.std(axis=0)
+    std = np.where(std < 1e-10, 1.0, std)
     
     backtester = Backtester(config)
     results = backtester.run(model, df, available_features, mean, std)
@@ -259,6 +293,7 @@ def quick_demo(config: Config):
     print_backtest_results(results)
     
     print("\n✓ Quick demo complete!")
+    print("  Note: This used a random (untrained) model, so results are meaningless.")
     print("  To run full training, use: python main.py train")
 
 
@@ -269,6 +304,8 @@ def main():
     parser.add_argument(
         'mode',
         choices=['train', 'backtest', 'paper', 'full', 'demo'],
+        nargs='?',
+        default='demo',
         help='Mode to run: train, backtest, paper (paper trading), full (complete pipeline), demo (quick test)'
     )
     parser.add_argument(
@@ -295,6 +332,12 @@ def main():
         default='BTCUSDT',
         help='Trading symbol'
     )
+    parser.add_argument(
+        '--device',
+        type=str,
+        default=None,
+        help='Device to use (cuda/cpu). Auto-detect if not specified.'
+    )
     
     args = parser.parse_args()
     
@@ -302,12 +345,20 @@ def main():
     config = Config()
     config.data.symbol = args.symbol
     
+    if args.device:
+        config.training.device = args.device
+    
     # Print configuration
     print("\n=== Configuration ===")
     print(f"Symbol: {config.data.symbol}")
     print(f"Interval: {config.data.interval}")
     print(f"Lookback: {config.data.lookback_window}")
     print(f"Device: {config.training.device}")
+    
+    # Check CUDA availability
+    if config.training.device == "cuda" and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available, falling back to CPU")
+        config.training.device = "cpu"
     
     # Run selected mode
     if args.mode == 'train':
@@ -331,8 +382,4 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        # Default to demo mode if no arguments
-        sys.argv.append('demo')
-    
     main()
