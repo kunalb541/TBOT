@@ -15,13 +15,16 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import logging
 
 import torch
 import torch.nn as nn
 
 from config import Config, DEFAULT_CONFIG
 from model import CausalTimeSeriesTransformer
-from data import CryptoDataFetcher, compute_technical_indicators
+from data import CryptoDataFetcher, compute_technical_indicators, FEATURE_COLS
+
+logger = logging.getLogger(__name__)
 
 
 class PositionType(Enum):
@@ -116,17 +119,13 @@ class Backtester:
         self.state = None
     
     def _calculate_slippage(self, price: float, position_type: PositionType) -> float:
-        """
-        Apply slippage to execution price.
-        Long entry / Short exit: price increases (worse fill)
-        Short entry / Long exit: price decreases (worse fill)
-        """
+        """Apply slippage to execution price."""
         slippage = price * self.config.trading.slippage_pct
         
         if position_type == PositionType.LONG:
-            return price + slippage  # Worse fill for long entry
+            return price + slippage
         else:
-            return price - slippage  # Worse fill for short entry
+            return price - slippage
     
     def _calculate_fee(self, price: float, size: float, is_taker: bool = True) -> float:
         """Calculate trading fee."""
@@ -143,17 +142,11 @@ class Backtester:
         if self.state.position != PositionType.NONE:
             return False
         
-        # Calculate position size
         capital_for_trade = self.state.capital * self.config.trading.position_size
-        
-        # Apply slippage
         exec_price = self._calculate_slippage(price, position_type)
-        
-        # Calculate size and fee
         fee = self._calculate_fee(exec_price, capital_for_trade / exec_price)
         position_size = (capital_for_trade - fee) / exec_price
         
-        # Set stop loss and take profit
         if position_type == PositionType.LONG:
             stop_loss = exec_price * (1 - self.config.trading.stop_loss_pct)
             take_profit = exec_price * (1 + self.config.trading.take_profit_pct)
@@ -161,7 +154,6 @@ class Backtester:
             stop_loss = exec_price * (1 + self.config.trading.stop_loss_pct)
             take_profit = exec_price * (1 - self.config.trading.take_profit_pct)
         
-        # Update state
         self.state.position = position_type
         self.state.position_size = position_size
         self.state.entry_price = exec_price
@@ -181,28 +173,22 @@ class Backtester:
         if self.state.position == PositionType.NONE:
             return None
         
-        # Apply slippage (opposite direction)
         opposite_type = (PositionType.SHORT if self.state.position == PositionType.LONG 
                         else PositionType.LONG)
         exec_price = self._calculate_slippage(price, opposite_type)
-        
-        # Calculate fees
         exit_fee = self._calculate_fee(exec_price, self.state.position_size)
         
-        # Calculate PnL
         if self.state.position == PositionType.LONG:
             gross_pnl = (exec_price - self.state.entry_price) * self.state.position_size
-        else:  # SHORT
+        else:
             gross_pnl = (self.state.entry_price - exec_price) * self.state.position_size
         
-        # Approximate entry fee (we stored the position size after fees)
         entry_value = self.state.entry_price * self.state.position_size
         entry_fee = entry_value * self.config.trading.taker_fee / (1 - self.config.trading.taker_fee)
         
         net_pnl = gross_pnl - exit_fee
-        pnl_pct = net_pnl / (entry_value + entry_fee)
+        pnl_pct = net_pnl / (entry_value + entry_fee) if (entry_value + entry_fee) > 0 else 0
         
-        # Create trade record
         trade = Trade(
             entry_time=self.state.entry_time,
             entry_price=self.state.entry_price,
@@ -217,10 +203,7 @@ class Backtester:
             exit_reason=reason
         )
         
-        # Update capital
         self.state.capital += net_pnl
-        
-        # Reset position
         self.state.position = PositionType.NONE
         self.state.position_size = 0.0
         self.state.entry_price = 0.0
@@ -239,18 +222,13 @@ class Backtester:
             return None
         
         if self.state.position == PositionType.LONG:
-            # Check stop loss
             if low <= self.state.stop_loss:
                 return self._close_position(timestamp, self.state.stop_loss, "stop_loss")
-            # Check take profit
             if high >= self.state.take_profit:
                 return self._close_position(timestamp, self.state.take_profit, "take_profit")
-        
-        else:  # SHORT
-            # Check stop loss
+        else:
             if high >= self.state.stop_loss:
                 return self._close_position(timestamp, self.state.stop_loss, "stop_loss")
-            # Check take profit
             if low <= self.state.take_profit:
                 return self._close_position(timestamp, self.state.take_profit, "take_profit")
         
@@ -270,7 +248,6 @@ class Backtester:
         self.state.equity_curve.append(equity)
         self.state.timestamps.append(timestamp)
         
-        # Track peak for drawdown calculation
         if equity > self.state.peak_capital:
             self.state.peak_capital = equity
     
@@ -279,17 +256,7 @@ class Backtester:
         prediction: int,
         confidence: float
     ) -> Optional[PositionType]:
-        """
-        Convert model prediction to trading action.
-        
-        Args:
-            prediction: 0=Hold, 1=Long, 2=Short
-            confidence: Confidence score
-            
-        Returns:
-            Position type to open, or None
-        """
-        # Check confidence threshold
+        """Convert model prediction to trading action."""
         if confidence < self.config.trading.min_confidence:
             return None
         
@@ -311,22 +278,10 @@ class Backtester:
         Run backtest.
         
         CRITICAL: Processes data in STRICT chronological order.
-        Each decision is based ONLY on data available at that time.
-        
-        Args:
-            model: Trained model
-            df: OHLCV DataFrame with computed indicators
-            feature_cols: Feature column names
-            scaler_mean: Feature mean for normalization
-            scaler_std: Feature std for normalization
-            
-        Returns:
-            BacktestResults object
         """
         model.eval()
         device = next(model.parameters()).device
         
-        # Initialize state
         self.state = BacktestState(
             capital=self.config.trading.initial_capital,
             peak_capital=self.config.trading.initial_capital
@@ -334,12 +289,11 @@ class Backtester:
         
         lookback = self.config.data.lookback_window
         
-        print(f"\n=== Running Backtest ===")
-        print(f"Initial capital: ${self.state.capital:,.2f}")
-        print(f"Period: {df.index[lookback]} to {df.index[-1]}")
-        print(f"Total candles: {len(df) - lookback}")
+        logger.info(f"\n=== Running Backtest ===")
+        logger.info(f"Initial capital: ${self.state.capital:,.2f}")
+        logger.info(f"Period: {df.index[lookback]} to {df.index[-1]}")
+        logger.info(f"Total candles: {len(df) - lookback}")
         
-        # Process each candle chronologically
         for i in range(lookback, len(df)):
             timestamp = df.index[i]
             current_candle = df.iloc[i]
@@ -348,7 +302,14 @@ class Backtester:
             history = df.iloc[i - lookback:i]
             
             # Extract features and normalize
-            features = history[feature_cols].values
+            available_features = [c for c in feature_cols if c in history.columns]
+            features = history[available_features].values
+            
+            # Ensure scaler dimensions match
+            if len(scaler_mean) != features.shape[1]:
+                logger.warning(f"Feature dimension mismatch: {features.shape[1]} vs {len(scaler_mean)}")
+                continue
+                
             features_normalized = (features - scaler_mean) / (scaler_std + 1e-10)
             
             # Check stop loss / take profit first
@@ -368,15 +329,12 @@ class Backtester:
                 confidence = conf[0].item()
             
             # Execute trading logic using NEXT candle open price
-            # This simulates realistic execution
             if i + 1 < len(df):
                 next_open = df.iloc[i + 1]['open']
                 
-                # If we have a position and signal changes, close it
                 if self.state.position != PositionType.NONE:
-                    action = self._signal_to_action(prediction, confidence)
                     should_close = (
-                        prediction == 0 or  # Hold signal
+                        prediction == 0 or
                         (self.state.position == PositionType.LONG and prediction == 2) or
                         (self.state.position == PositionType.SHORT and prediction == 1)
                     )
@@ -385,20 +343,18 @@ class Backtester:
                         if trade:
                             self.state.trades.append(trade)
                 
-                # If no position, check for entry
                 if self.state.position == PositionType.NONE:
                     action = self._signal_to_action(prediction, confidence)
                     if action is not None:
                         self._open_position(timestamp, next_open, action)
             
-            # Update equity curve
             self._update_equity(timestamp, current_candle['close'])
             
             # Check max drawdown limit
             if self.state.equity_curve:
                 current_dd = (self.state.peak_capital - self.state.equity_curve[-1]) / self.state.peak_capital
                 if current_dd >= self.config.trading.max_drawdown_pct:
-                    print(f"\nMax drawdown limit reached at {timestamp}")
+                    logger.info(f"\nMax drawdown limit reached at {timestamp}")
                     if self.state.position != PositionType.NONE:
                         trade = self._close_position(timestamp, current_candle['close'], "max_drawdown")
                         if trade:
@@ -419,11 +375,9 @@ class Backtester:
         initial_capital = self.config.trading.initial_capital
         final_capital = self.state.capital
         
-        # Basic returns
         total_return = final_capital - initial_capital
         total_return_pct = (total_return / initial_capital) * 100
         
-        # Trade statistics
         trades = self.state.trades
         total_trades = len(trades)
         
@@ -445,11 +399,10 @@ class Backtester:
             total_losses = abs(sum(losing_pnls)) if losing_pnls else 1.0
             profit_factor = total_wins / total_losses if total_losses > 0 else float('inf')
             
-            # Average trade duration
             durations = []
             for t in trades:
                 if t.entry_time and t.exit_time:
-                    duration = (t.exit_time - t.entry_time).total_seconds() / 3600  # hours
+                    duration = (t.exit_time - t.entry_time).total_seconds() / 3600
                     durations.append(duration)
             avg_trade_duration = np.mean(durations) if durations else 0.0
         else:
@@ -462,26 +415,21 @@ class Backtester:
             profit_factor = 0.0
             avg_trade_duration = 0.0
         
-        # Risk metrics from equity curve
         equity_curve = np.array(self.state.equity_curve)
         
         if len(equity_curve) > 1:
-            # Drawdown
             peak = np.maximum.accumulate(equity_curve)
             drawdown = (peak - equity_curve) / peak
             max_drawdown_pct = np.max(drawdown) * 100
             max_drawdown = np.max(peak - equity_curve)
             
-            # Returns for Sharpe/Sortino
             returns = np.diff(equity_curve) / equity_curve[:-1]
             
-            # Sharpe ratio (annualized, assuming hourly data)
             if np.std(returns) > 0:
                 sharpe_ratio = np.sqrt(24 * 365) * np.mean(returns) / np.std(returns)
             else:
                 sharpe_ratio = 0.0
             
-            # Sortino ratio
             negative_returns = returns[returns < 0]
             if len(negative_returns) > 0 and np.std(negative_returns) > 0:
                 sortino_ratio = np.sqrt(24 * 365) * np.mean(returns) / np.std(negative_returns)
@@ -493,7 +441,6 @@ class Backtester:
             sharpe_ratio = 0.0
             sortino_ratio = 0.0
         
-        # Create equity curve DataFrame
         equity_df = pd.DataFrame({
             'timestamp': self.state.timestamps,
             'equity': self.state.equity_curve
@@ -553,7 +500,6 @@ def print_backtest_results(results: BacktestResults):
     
     print("\n" + "="*60)
     
-    # Trade breakdown by exit reason
     if results.trades:
         reasons = {}
         for t in results.trades:
@@ -564,86 +510,21 @@ def print_backtest_results(results: BacktestResults):
             print(f"{reason:20s}: {count}")
 
 
-def run_backtest_from_checkpoint(
-    checkpoint_path: str,
-    config: Config = DEFAULT_CONFIG,
-    n_candles: int = 3000
-) -> BacktestResults:
-    """
-    Run backtest using a saved model checkpoint.
-    """
-    import torch
-    from model import CausalTimeSeriesTransformer
-    from data import CryptoDataFetcher, compute_technical_indicators
-    
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path)
-    model_config = checkpoint['config']
-    feature_names = checkpoint['feature_names']
-    
-    # Create model
-    from config import ModelConfig
-    mc = ModelConfig(**model_config)
-    model = CausalTimeSeriesTransformer(mc)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    # Fetch data
-    fetcher = CryptoDataFetcher(config)
-    df = fetcher.fetch_historical(
-        symbol=config.data.symbol,
-        interval=config.data.interval,
-        n_candles=n_candles
-    )
-    
-    # Compute indicators
-    df = compute_technical_indicators(df, config)
-    df = df.dropna()
-    
-    # Normalize features (using saved statistics would be better in production)
-    features = df[feature_names].values
-    scaler_mean = features[:int(len(features)*0.7)].mean(axis=0)
-    scaler_std = features[:int(len(features)*0.7)].std(axis=0)
-    
-    # Run backtest
-    backtester = Backtester(config)
-    results = backtester.run(
-        model=model,
-        df=df,
-        feature_cols=feature_names,
-        scaler_mean=scaler_mean,
-        scaler_std=scaler_std
-    )
-    
-    return results
-
-
 if __name__ == "__main__":
-    # Test backtest with a random model
     config = Config()
     config.model.input_dim = 22
+    config.data.use_real_data = True
     
     from model import CausalTimeSeriesTransformer
     model = CausalTimeSeriesTransformer(config.model)
     
-    # Generate fake data
-    from data import CryptoDataFetcher, compute_technical_indicators
+    from data import CryptoDataFetcher
     fetcher = CryptoDataFetcher(config)
     df = fetcher.fetch_historical(config.data.symbol, config.data.interval, n_candles=3000)
     df = compute_technical_indicators(df, config)
     df = df.dropna()
     
-    feature_cols = [
-        'returns', 'log_returns', 'range_pct', 'body_pct',
-        'upper_wick', 'lower_wick',
-        'rsi_normalized', 'macd_normalized', 'macd_hist_normalized',
-        'bb_position', 'bb_width', 'atr_normalized',
-        'ema_9', 'ema_21', 'ema_50', 'ema_200',
-        'volume_normalized', 'volume_ratio',
-        'momentum_5', 'momentum_10', 'momentum_20',
-        'volatility_normalized'
-    ]
-    feature_cols = [c for c in feature_cols if c in df.columns]
+    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
     
     features = df[feature_cols].values
     mean = features.mean(axis=0)
