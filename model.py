@@ -372,11 +372,14 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def verify_causal_masking(model: CausalTimeSeriesTransformer, seq_len: int = 10):
+def verify_causal_masking(model: CausalTimeSeriesTransformer, seq_len: int = 10) -> bool:
     """
     Verify that causal masking is working correctly.
     
     Test: Changing future inputs should NOT affect current outputs.
+    
+    Returns:
+        True if causal masking is working correctly
     """
     model.eval()
     device = next(model.parameters()).device
