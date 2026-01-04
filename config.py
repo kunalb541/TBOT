@@ -25,7 +25,7 @@ class BinanceConfig:
     api_secret: str = field(default_factory=lambda: os.environ.get("BINANCE_API_SECRET", ""))
     
     # Use testnet for safety during development
-    testnet: bool = True
+    testnet: bool = False
     testnet_api_url: str = "https://testnet.binancefuture.com"
     
     # Rate limiting
@@ -37,8 +37,8 @@ class BinanceConfig:
 class DataConfig:
     """Data-related configuration."""
     symbol: str = "BTCUSDT"
-    interval: str = "1h"  # 1h candles for less noise
-    lookback_window: int = 168  # 7 days of hourly data
+    interval: str = "15m"  # 1h candles for less noise
+    lookback_window: int = 200  # 7 days of hourly data
     prediction_horizon: int = 1  # Predict next candle
     train_ratio: float = 0.7
     val_ratio: float = 0.15
@@ -87,10 +87,10 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training configuration."""
-    batch_size: int = 64
+    batch_size: int = 512
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
-    epochs: int = 100
+    epochs: int = 500
     patience: int = 15  # Early stopping patience
     
     # Learning rate scheduler
@@ -104,12 +104,12 @@ class TrainingConfig:
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     
     # Multi-GPU / Distributed training
-    distributed: bool = False
-    world_size: int = 1
+    distributed: bool = True
+    world_size: int = 4
     local_rank: int = 0
     
     # Mixed precision training
-    use_amp: bool = True
+    use_amp: bool = False
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -124,16 +124,16 @@ class TrainingConfig:
 class TradingConfig:
     """Trading/Backtesting configuration."""
     initial_capital: float = 10000.0
-    position_size: float = 0.1  # 10% of capital per trade
-    leverage: int = 1  # No leverage for safety
+    position_size: float = 0.3  # 10% of capital per trade
+    leverage: int = 75
     
     # Fees (Binance-like)
     maker_fee: float = 0.0002  # 0.02%
     taker_fee: float = 0.0004  # 0.04%
     
     # Risk management
-    stop_loss_pct: float = 0.02  # 2% stop loss
-    take_profit_pct: float = 0.04  # 4% take profit
+    stop_loss_pct: float = 0.10  
+    take_profit_pct: float = 0.20  
     max_drawdown_pct: float = 0.15  # 15% max drawdown
     daily_loss_limit: float = 500.0
     daily_profit_target: float = 500.0
@@ -142,7 +142,7 @@ class TradingConfig:
     slippage_pct: float = 0.001  # 0.1%
     
     # Minimum confidence threshold for trades
-    min_confidence: float = 0.6
+    min_confidence: float = 0.33
 
 
 @dataclass
@@ -150,7 +150,7 @@ class RetrainingConfig:
     """Auto-retraining configuration."""
     enabled: bool = True
     retrain_interval_hours: int = 24 * 7  # Weekly
-    min_new_samples: int = 168  # At least 1 week of new data
+    min_new_samples: int = 200  
     performance_threshold: float = 0.0  # Retrain if PnL drops below this
     rolling_window_days: int = 90  # Use last 90 days for retraining
 

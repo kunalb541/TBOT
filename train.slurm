@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -p gpu_a100_short
-#SBATCH -N 2
+#SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
 #SBATCH --mem-per-gpu=94000mb
@@ -11,17 +11,15 @@
 #SBATCH --job-name=crypto_bot
 #SBATCH --exclusive
 #SBATCH --signal=B:USR1@120
-#SBATCH --mail-user=kunal29bhatia@gmail.com
-#SBATCH --mail-type=ALL
 
 # ============================================================================
 # SLURM Job Script for Crypto Trading Bot Training on bw3.0 HPC
 # ============================================================================
 #
 # Usage:
-#   Single node (4 GPUs):   sbatch --nodes=1 train_hpc.slurm
-#   Multi node (8 GPUs):    sbatch --nodes=2 train_hpc.slurm
-#   Max scale (48 GPUs):    sbatch --nodes=12 train_hpc.slurm
+#   Single node (4 GPUs):   sbatch --nodes=1 train.slurm
+#   Multi node (8 GPUs):    sbatch --nodes=2 train.slurm
+#   Max scale (48 GPUs):    sbatch --nodes=12 train.slurm
 #
 # Partition: gpu_a100_short
 #   - GPU nodes with Ice Lake + NVIDIA A100 x4
@@ -43,8 +41,16 @@ echo "============================================"
 # =============================================================================
 # ENVIRONMENT SETUP
 # =============================================================================
+
+# Load conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate bot
+conda activate crypto_bot 2>/dev/null || {
+    echo "Creating crypto_bot environment..."
+    conda create -n crypto_bot python=3.10 -y
+    conda activate crypto_bot
+    pip install torch>=2.0.0 numpy>=1.24.0 pandas>=2.0.0 tqdm>=4.65.0 requests>=2.28.0
+}
+
 # Navigate to project directory
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
@@ -176,14 +182,12 @@ cleanup_tmp() {
         echo \"Node \$(hostname): /tmp cleaned\"
     "
 }
-# Check for latest checkpoint (prioritize numbered checkpoints, then best)
-if ls checkpoints/checkpoint_epoch_*.pt 1> /dev/null 2>&1; then
-    LATEST_CHECKPOINT=$(ls -t checkpoints/checkpoint_epoch_*.pt | head -1)
-elif [[ -f "checkpoints/best_model.pt" ]]; then
-    LATEST_CHECKPOINT="checkpoints/best_model.pt"
-else
-    LATEST_CHECKPOINT=""
-fi
+
+cleanup_shm() {
+    log_info "Cleaning /dev/shm..."
+    srun --ntasks=$SLURM_NNODES --ntasks-per-node=1 bash -c "
+        rm -f /dev/shm/job${SLURM_JOB_ID}* 2>/dev/null || true
+        echo \"Node \$(hostname): /dev/shm cleaned\"
     "
 }
 
@@ -241,11 +245,16 @@ trap handle_preemption USR1
 RESUME_FLAG=""
 OUTPUT_DIR_FLAG=""
 
-# Check if we have a checkpoint to resume from
-LATEST_CHECKPOINT="checkpoints/checkpoint_latest.pt"
-BEST_CHECKPOINT="checkpoints/best_model.pt"
+# Check for latest checkpoint (prioritize numbered checkpoints, then best)
+if ls checkpoints/checkpoint_epoch_*.pt 1> /dev/null 2>&1; then
+    LATEST_CHECKPOINT=$(ls -t checkpoints/checkpoint_epoch_*.pt | head -1)
+elif [[ -f "checkpoints/best_model.pt" ]]; then
+    LATEST_CHECKPOINT="checkpoints/best_model.pt"
+else
+    LATEST_CHECKPOINT=""
+fi
 
-if [[ -f "${LATEST_CHECKPOINT}" ]]; then
+if [[ -n "${LATEST_CHECKPOINT}" ]] && [[ -f "${LATEST_CHECKPOINT}" ]]; then
     CURRENT_EPOCH=$(get_checkpoint_epoch "${LATEST_CHECKPOINT}")
     log_info "Found checkpoint at epoch ${CURRENT_EPOCH}"
     
@@ -346,18 +355,10 @@ if [ $TRAIN_EXIT_CODE -eq 0 ]; then
     fi
     
     if [[ -f "backtest_results.json" ]]; then
-        log_info "Backtest results: backtest_results.json"
-        python3 -c "
-import json
-try:
-    with open('backtest_results.json') as f:
-        results = json.load(f)
-    print(f"  Total Return: {results['total_return_pct']:.2f}%")
-    print(f"  Win Rate: {results['win_rate']*100:.1f}%")
-    print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
-    print(f"  Max Drawdown: {results['max_drawdown_pct']:.2f}%")
-except Exception as e:
-    print(f"  Error reading results: {e}")
+        log_info "Backtest results saved to: backtest_results.json"
+        echo ""
+        cat backtest_results.json
+        echo ""
     fi
 else
     log_error "Training failed with exit code $TRAIN_EXIT_CODE"
