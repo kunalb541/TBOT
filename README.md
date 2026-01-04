@@ -1,315 +1,221 @@
-# Crypto Trading Bot with Causal Time Series Transformer
+# Crypto Trading Bot - Causal Transformer
 
-A production-ready proof-of-concept for an AI-powered cryptocurrency futures trading bot using a **Causal Time Series Transformer** with strict anti-lookahead measures.
+AI-powered cryptocurrency futures trading bot with strict anti-lookahead measures.
 
 ## 🚀 Quick Start
 
-### 1. Install Dependencies
-
+### Local Testing
 ```bash
+# Install
 pip install -r requirements.txt
-```
 
-### 2. Test Data Fetching (No API key needed!)
-
-```bash
-# Test that Binance data fetching works
+# Test Binance data (no API key needed!)
 python main.py test-data
-```
 
-### 3. Quick Demo (No training needed)
-
-```bash
-# Run a quick demo with random model
+# Quick demo
 python main.py demo
-```
 
-### 4. Full Training Pipeline
-
-```bash
-# Train with real Binance data
+# Train model
 python main.py train --candles 10000 --symbol BTCUSDT
 
-# Or use fake data for testing
-python main.py train --candles 10000 --fake-data
-```
-
-### 5. Backtest
-
-```bash
+# Backtest
 python main.py backtest
-```
 
-### 6. Full Pipeline (Train + Backtest)
-
-```bash
+# Full pipeline
 python main.py full
 ```
 
----
-
-## 🖥️ HPC Training (SLURM)
-
-### Single GPU
-
+### HPC Training (bw3.0)
 ```bash
-sbatch --gres=gpu:1 train_hpc.slurm
+# Setup environment (first time only)
+conda create -n crypto_bot python=3.10 -y
+conda activate crypto_bot
+pip install -r requirements.txt
+
+# Submit job
+mkdir -p logs
+sbatch --nodes=1 train.slurm    # 1 node  = 4 GPUs
+sbatch --nodes=2 train.slurm    # 2 nodes = 8 GPUs
+sbatch --nodes=12 train.slurm   # Max scale = 48 GPUs
+
+# Monitor
+tail -f logs/crypto_train_*.out
+squeue -u $USER
+
+# Cancel if needed
+scancel <JOB_ID>
 ```
 
-### Multi-GPU (4 GPUs)
+## 📊 Data Source
 
-```bash
-sbatch --gres=gpu:4 train_hpc.slurm
-```
+**Real Binance data - no API keys required!**
 
-### Multi-Node (2 nodes × 4 GPUs = 8 GPUs)
+- Symbols: `BTCUSDT`, `ETHUSDT`, `BNBUSDT`, etc.
+- Intervals: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`, etc.
+- Fetches via public endpoints
+- Auto-pagination for 10k+ candles
+- Fallback to synthetic data if API fails
 
-```bash
-sbatch --nodes=2 --gres=gpu:4 train_hpc.slurm
-```
+## 🏗️ What Makes This Different
 
-### Custom Configuration
-
-```bash
-# Set environment variables before submission
-export N_CANDLES=20000
-export BATCH_SIZE=128
-export SYMBOL=ETHUSDT
-sbatch train_hpc.slurm
-```
-
-### Interactive GPU Session
-
-```bash
-# Request an interactive session
-srun --gres=gpu:1 --mem=32G --time=4:00:00 --pty bash
-
-# Then run training
-python main.py train --candles 10000
-```
-
----
-
-## 📊 Real Binance Data
-
-The bot fetches **real data from Binance** without requiring API keys! The public market data endpoints are free to use.
-
-```python
-from data import BinanceDataFetcher, CryptoDataFetcher
-
-# Direct Binance fetch
-fetcher = BinanceDataFetcher()
-df = fetcher.fetch_historical("BTCUSDT", "1h", n_candles=10000)
-
-# Unified interface (auto-detects config)
-fetcher = CryptoDataFetcher(config)
-df = fetcher.fetch_historical("BTCUSDT", "1h", n_candles=10000)
-```
-
-### Supported Symbols
-
-Any Binance Futures symbol works:
-- `BTCUSDT`, `ETHUSDT`, `BNBUSDT`
-- `1000PEPEUSDT`, `SOLUSDT`, etc.
-
-### Supported Intervals
-
-- `1m`, `3m`, `5m`, `15m`, `30m`
-- `1h`, `2h`, `4h`, `6h`, `8h`, `12h`
-- `1d`, `3d`, `1w`
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CAUSAL TRANSFORMER                           │
-├─────────────────────────────────────────────────────────────────┤
-│  Input Projection → Positional Encoding → Encoder Layers → Head │
-│                           ↓                                     │
-│            ┌────────────────────────────────┐                   │
-│            │   CAUSAL SELF-ATTENTION        │                   │
-│            │   Position i → attends to ≤ i  │                   │
-│            │   NO FUTURE INFORMATION LEAK   │                   │
-│            └────────────────────────────────┘                   │
-├─────────────────────────────────────────────────────────────────┤
-│  Output: [Hold=0, Long=1, Short=2] with confidence score        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔐 Anti-Lookahead Measures
-
-### 1. Causal Attention Masking
-```python
-# Each position can ONLY attend to previous positions
-mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-attn_scores.masked_fill_(mask, float('-inf'))
-```
-
-### 2. Temporal Data Splitting
-```
-|-------- Train --------|--- Val ---|--- Test ---|
-        t=0                t=0.7       t=0.85     t=1.0
-
-NO OVERLAP between splits
-Features computed BEFORE splitting
-```
-
-### 3. Realistic Trade Execution
-- Trades execute at **NEXT candle open** (not current close)
-- Slippage simulation applied
-- Realistic fee calculation
-
----
-
-## 📁 Project Structure
-
-```
-crypto_bot/
-├── config.py         # All configuration parameters
-├── data.py           # Binance data fetching + preprocessing
-├── model.py          # Causal Transformer architecture
-├── train.py          # Training pipeline (supports DDP)
-├── backtest.py       # Backtesting engine
-├── main.py           # Main entry point
-├── train_hpc.slurm   # SLURM job script for HPC
-├── requirements.txt  # Dependencies
-└── README.md         # This file
-```
-
----
-
-## 🐛 Bug Fixes & Improvements
-
-### Issues Fixed from Original Code:
-
-1. **Data Pipeline Fixes**
-   - Fixed sequence/label alignment in `TimeSeriesDataset`
-   - Proper lookback context for validation and test sets
-   - Scaler statistics now saved and loaded correctly
-
-2. **Real Data Integration**
-   - Added `BinanceDataFetcher` class with pagination support
-   - Rate limiting and retry logic for API calls
-   - Fallback to fake data if API fails
-
-3. **Training Improvements**
-   - Added distributed training support (DDP)
-   - Mixed precision training (AMP) for 2x speedup
-   - Better gradient clipping and weight initialization
-   - Label smoothing for better generalization
-
-4. **Model Fixes**
-   - Pre-LayerNorm architecture (more stable training)
-   - Cached causal mask for efficiency
-   - Fixed odd d_model dimensions in positional encoding
-
-5. **Configuration**
-   - Environment variable support for API keys
-   - Fixed float comparison in validation
-   - Auto-detection of device (CUDA/CPU)
-
----
+1. **Causal Masking**: Position i can ONLY see positions ≤ i (no future leakage)
+2. **Realistic Execution**: Trades at NEXT candle open + slippage + fees
+3. **Temporal Splitting**: Train → Val → Test (no overlap in time)
+4. **HPC Ready**: Multi-node distributed training with auto-resume
 
 ## ⚙️ Configuration
 
-All parameters can be modified in `config.py`:
-
+Edit `config.py`:
 ```python
-@dataclass
-class DataConfig:
-    symbol: str = "BTCUSDT"
-    interval: str = "1h"
-    lookback_window: int = 168  # 7 days
-    use_real_data: bool = True
+# Data
+symbol = "BTCUSDT"
+interval = "1h"
+lookback_window = 168  # 7 days
+use_real_data = True
 
-@dataclass
-class ModelConfig:
-    d_model: int = 128
-    nhead: int = 8
-    num_encoder_layers: int = 4
-    causal: bool = True  # CRITICAL!
+# Model
+d_model = 128
+num_encoder_layers = 4
+causal = True  # KEEP THIS TRUE!
 
-@dataclass
-class TradingConfig:
-    initial_capital: float = 10000.0
-    position_size: float = 0.1  # 10%
-    stop_loss_pct: float = 0.02  # 2%
-    take_profit_pct: float = 0.04  # 4%
-    min_confidence: float = 0.6
+# Trading
+initial_capital = 10000.0
+position_size = 0.1  # 10% per trade
+stop_loss_pct = 0.02  # 2%
+min_confidence = 0.6
 ```
 
----
+## 📈 Expected Results
 
-## 🔬 Verification
-
-The system includes built-in verification of causal masking:
-
-```python
-def verify_causal_masking(model, seq_len=10):
-    """
-    Test: Changing future inputs should NOT affect current outputs.
-    """
-    out1 = model(x)[:, 5, :]
-    
-    # Modify positions 6-9 (future)
-    x_modified[:, 6:, :] = random_data
-    
-    out2 = model(x_modified)[:, 5, :]
-    
-    # Should be identical with causal masking
-    assert torch.allclose(out1, out2)
-```
-
-Run verification:
-```bash
-python -c "from model import *; config=ModelConfig(input_dim=22); m=CausalTimeSeriesTransformer(config); verify_causal_masking(m)"
-```
-
----
-
-## 📈 Expected Performance
-
-With proper training on real data:
-
-| Metric | Random Model | Trained Model |
-|--------|-------------|---------------|
+| Metric | Random | Trained |
+|--------|--------|---------|
 | Accuracy | ~33% | 40-50% |
 | Win Rate | ~50% | 50-60% |
 | Sharpe | ~0 | 0.5-1.5 |
 
-**Note:** These are typical results. Market conditions vary, and past performance doesn't guarantee future results.
+## 🔧 HPC Environment Variables
 
----
+```bash
+# Custom training config
+export N_CANDLES=20000
+export BATCH_SIZE=128
+export EPOCHS=100
+export SYMBOL=ETHUSDT
+sbatch train.slurm
+```
 
-## ⚠️ Important Warnings
+## 📁 Files
 
-1. **API Keys**: Never commit API keys to git. Use environment variables:
-   ```bash
-   export BINANCE_API_KEY="your_key"
-   export BINANCE_API_SECRET="your_secret"
-   ```
+```
+├── config.py          # All settings
+├── data.py            # Binance fetcher + preprocessing
+├── model.py           # Causal Transformer
+├── train.py           # Training (DDP + AMP)
+├── backtest.py        # Backtesting engine
+├── main.py            # Entry point
+├── train.slurm        # HPC job script
+└── requirements.txt   # Dependencies
+```
 
-2. **Real Trading Risk**: This is a POC. Real trading involves significant financial risk.
+## ✅ What Works
 
-3. **Data Quality**: The model is only as good as the data. Ensure data quality before trusting results.
+- ✅ Real Binance data (no API key)
+- ✅ Multi-node distributed training
+- ✅ Mixed precision (2x speedup)
+- ✅ Auto-resume after preemption
+- ✅ Causal masking verified
+- ✅ Realistic backtesting
 
-4. **Overfitting**: Watch for overfitting in backtests. Use proper train/val/test splits.
+## 🐛 Common Issues
 
----
+**"No data fetched"**
+```bash
+# Use fake data as fallback
+python main.py train --fake-data
+```
 
-## 📚 References
+**"CUDA out of memory"**
+```bash
+# Reduce batch size in config.py
+batch_size = 32  # instead of 64
+```
 
-- [Temporal Fusion Transformers (TFT)](https://arxiv.org/abs/1912.09363)
-- [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
-- [Informer for Long Sequence Time-Series](https://arxiv.org/abs/2012.07436)
-- [Binance API Documentation](https://binance-docs.github.io/apidocs/)
+**"Job keeps failing on HPC"**
+```bash
+# Check logs
+cat logs/crypto_train_*.err
 
----
+# Verify environment
+conda activate crypto_bot
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+## ⚠️ Important
+
+1. **Not financial advice** - This is educational/research code
+2. **No real trading** - Use paper trading to validate
+3. **Past performance ≠ future results**
+4. **API keys** - Never commit to git (use env vars)
+5. **Risk management** - Always use stop losses
+
+## 🚦 Next Steps
+
+1. Test locally: `python main.py demo`
+2. Train small: `python main.py train --candles 2000`
+3. Validate backtest results
+4. If good → scale up on HPC
+5. Paper trade before considering real money
+
+## 📚 Key Concepts
+
+**Causal Masking**: Prevents model from "seeing the future"
+```python
+# Position 5 can only see [0,1,2,3,4,5]
+# Position 5 CANNOT see [6,7,8,...]
+```
+
+**Temporal Split**: Data ordered by time
+```
+Train: Jan-Jun → Val: Jul-Aug → Test: Sep-Oct
+```
+
+**Realistic Execution**: 
+```
+Signal at candle[i] → Execute at candle[i+1].open
+```
+
+## 📞 Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Import errors | `pip install -r requirements.txt` |
+| No CUDA | Add `--device cpu` to commands |
+| NCCL errors on HPC | Check SLURM logs, nodes may be down |
+| Low accuracy | Normal! 40-50% is good for trading |
+| Overfitting | Reduce model size or add dropout |
+
+## 🎯 Performance Tuning
+
+**For speed:**
+- Enable AMP: `use_amp = True` 
+- Increase batch size
+- Use multiple nodes
+
+**For accuracy:**
+- More data: `--candles 20000`
+- Tune hyperparameters
+- Try different symbols/intervals
+- Ensemble models
 
 ## 📄 License
 
-MIT License - Use at your own risk.
+MIT - Use at your own risk
+
+---
+
+**Ready to start?**
+```bash
+python main.py test-data  # Verify setup
+python main.py demo       # Quick test
+python main.py train      # Full training
+```
