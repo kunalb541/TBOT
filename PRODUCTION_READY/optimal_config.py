@@ -68,8 +68,8 @@ class ModelConfig:
     
     # Transformer architecture
     d_model: int = 32
-    nhead: int = 8
-    num_encoder_layers: int = 6
+    nhead: int = 4
+    num_encoder_layers: int = 2
     dim_feedforward: int = 512
     dropout: float = 0.1
     
